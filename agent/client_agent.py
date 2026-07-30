@@ -36,10 +36,17 @@ urllib3.disable_warnings()
 
 from common.config import IDP_HOST, IDP_PORT, GATEWAY_HOST, GATEWAY_PORT
 from common.totp import current_totp
+from common.tls_utils import scheme as _tls_scheme
 from agent.device_posture import compute_trust_score
 
-IDP_URL = f"https://{IDP_HOST}:{IDP_PORT}"
-GATEWAY_URL = f"https://{GATEWAY_HOST}:{GATEWAY_PORT}"
+# Match whatever scheme the servers actually came up on (https if openssl
+# was available to generate a cert, http otherwise) -- hardcoding "https"
+# here caused SSL: WRONG_VERSION_NUMBER errors on machines without OpenSSL
+# on PATH, because the servers would silently fall back to plain HTTP while
+# this client kept trying TLS.
+_SCHEME = _tls_scheme()
+IDP_URL = f"{_SCHEME}://{IDP_HOST}:{IDP_PORT}"
+GATEWAY_URL = f"{_SCHEME}://{GATEWAY_HOST}:{GATEWAY_PORT}"
 
 
 def _demo_secret_lookup(username: str) -> str:

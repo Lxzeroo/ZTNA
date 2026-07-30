@@ -30,10 +30,14 @@ import urllib3
 urllib3.disable_warnings()
 
 from common.totp import current_totp
+from common.tls_utils import scheme as _tls_scheme
 from idp.users_db import USERS
 
-IDP_URL = "https://127.0.0.1:9000"
-GATEWAY_URL = "https://127.0.0.1:9200"
+# Use whatever scheme the services actually come up on -- see the same fix
+# in agent/client_agent.py for why this can't be hardcoded to "https".
+_SCHEME = _tls_scheme()
+IDP_URL = f"{_SCHEME}://127.0.0.1:9000"
+GATEWAY_URL = f"{_SCHEME}://127.0.0.1:9200"
 
 _procs = {}
 

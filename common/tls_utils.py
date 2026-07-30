@@ -48,6 +48,17 @@ def ensure_self_signed_cert() -> bool:
     return os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE)
 
 
+def scheme() -> str:
+    """The URL scheme ("https" or "http") that services will actually come
+    up on. Callers that construct URLs to talk to the IdP/Gateway (the
+    client agent, the test suite) MUST use this instead of hardcoding
+    "https" -- otherwise, on a machine without openssl on PATH, the server
+    silently falls back to plain HTTP while the client keeps trying TLS,
+    producing a confusing `SSL: WRONG_VERSION_NUMBER` error.
+    """
+    return "https" if ensure_self_signed_cert() else "http"
+
+
 def wrap_server_socket(httpd):
     """Wrap an http.server socket in TLS in-place, if a cert is available.
 
