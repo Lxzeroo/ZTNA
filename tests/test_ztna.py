@@ -97,12 +97,33 @@ def tearDownModule():
             p.communicate()
 
 
-def login(username, password, device_trust_score, otp=None):
+def login(username, password, device_trust_score, otp=None, device_id=None, attestation_signature=None):
     code = otp if otp is not None else current_totp(USERS[username]["totp_secret"])
-    return requests.post(f"{IDP_URL}/login", json={
+    body = {
         "username": username, "password": password, "otp": code,
         "device_trust_score": device_trust_score,
+    }
+    if device_id is not None:
+        body["device_id"] = device_id
+    if attestation_signature is not None:
+        body["attestation_signature"] = attestation_signature
+    return requests.post(f"{IDP_URL}/login", json=body, verify=False, timeout=5)
+
+
+def enroll_and_sign(device_id):
+    """Full real protocol: enroll a fresh device key, request a challenge,
+    sign it. Returns (public_key_pem, signature_b64) using whatever
+    attestation backend is available in this environment (TPM on Windows,
+    software fallback elsewhere -- see agent/device_attestation.py)."""
+    from agent import device_attestation
+    info = device_attestation.ensure_enrolled(device_id)
+    requests.post(f"{IDP_URL}/enroll", json={
+        "device_id": device_id, "public_key_pem": info["public_key_pem"],
     }, verify=False, timeout=5)
+    chal = requests.post(f"{IDP_URL}/challenge", json={"device_id": device_id},
+                          verify=False, timeout=5).json()
+    sig = device_attestation.sign_nonce(device_id, chal["nonce"], info["hardware_backed"])
+    return info["public_key_pem"], sig
 
 
 def access(resource, token):
@@ -151,7 +172,14 @@ class TestLeastPrivilegeAccessControl(unittest.TestCase):
         self.assertIn("insufficient_role", r.json()["reason"])
 
     def test_finance_manager_with_healthy_device_reaches_finance_app(self):
-        token = login("bob", "Manager#2026", 95).json()["access_token"]
+        # finance-app requires attestation (see TestDeviceAttestation for
+        # that dimension in isolation) -- complete it here too since this
+        # test is specifically about role + trust score being sufficient,
+        # not about attestation.
+        device_id = f"test-device-role-{id(self)}"
+        _, signature = enroll_and_sign(device_id)
+        token = login("bob", "Manager#2026", 95, device_id=device_id,
+                       attestation_signature=signature).json()["access_token"]
         r = access("finance-app", token)
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["resource"], "finance-app")
@@ -195,7 +223,10 @@ class TestTokenIntegrityAndContinuousVerification(unittest.TestCase):
         a session indefinitely after the initial login (continuous
         verification), by showing the SAME token that worked a moment ago
         is refused once its short TTL elapses."""
-        token = login("bob", "Manager#2026", 95).json()["access_token"]
+        device_id = f"test-device-ttl-{id(self)}"
+        _, signature = enroll_and_sign(device_id)
+        token = login("bob", "Manager#2026", 95, device_id=device_id,
+                       attestation_signature=signature).json()["access_token"]
         r1 = access("finance-app", token)
         self.assertEqual(r1.status_code, 200)
 
@@ -214,6 +245,65 @@ class TestUnknownResource(unittest.TestCase):
         r = access("does-not-exist", token)
         self.assertEqual(r.status_code, 403)
         self.assertEqual(r.json()["reason"], "unknown_resource")
+
+
+class TestDeviceAttestation(unittest.TestCase):
+    """Cryptographic device attestation (idp/device_registry.py,
+    agent/device_attestation.py): finance-app requires a verified
+    challenge-response signature over the enrolled key, independent of the
+    self-reported device_trust_score -- this is what makes attestation a
+    materially stronger guarantee than posture self-report alone."""
+
+    def test_high_trust_correct_role_but_no_attestation_is_denied(self):
+        # Role and trust score both satisfy finance-app's thresholds, but
+        # no attestation signature is submitted at all.
+        token = login("bob", "Manager#2026", 95).json()["access_token"]
+        r = access("finance-app", token)
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["reason"], "attestation_required")
+
+    def test_valid_attestation_signature_is_accepted(self):
+        device_id = f"test-device-{id(self)}"
+        _, signature = enroll_and_sign(device_id)
+        resp = login("bob", "Manager#2026", 95, device_id=device_id, attestation_signature=signature)
+        self.assertTrue(resp.json()["claims"]["attested"])
+        token = resp.json()["access_token"]
+        r = access("finance-app", token)
+        self.assertEqual(r.status_code, 200)
+
+    def test_forged_attestation_signature_is_rejected(self):
+        device_id = f"test-device-forge-{id(self)}"
+        _, signature = enroll_and_sign(device_id)
+        tampered = signature[:-4] + ("AAAA" if signature[-4:] != "AAAA" else "BBBB")
+        resp = login("bob", "Manager#2026", 95, device_id=device_id, attestation_signature=tampered)
+        self.assertFalse(resp.json()["claims"]["attested"])
+        token = resp.json()["access_token"]
+        r = access("finance-app", token)
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["reason"], "attestation_required")
+
+    def test_attestation_signature_cannot_be_replayed(self):
+        device_id = f"test-device-replay-{id(self)}"
+        _, signature = enroll_and_sign(device_id)
+
+        first = login("bob", "Manager#2026", 95, device_id=device_id, attestation_signature=signature)
+        self.assertTrue(first.json()["claims"]["attested"])
+
+        # Re-submit the SAME signature again -- the nonce it answered was
+        # already consumed by the first login, so this must NOT verify a
+        # second time even though the signature bytes are identical and
+        # valid in isolation.
+        second = login("bob", "Manager#2026", 95, device_id=device_id, attestation_signature=signature)
+        self.assertFalse(second.json()["claims"]["attested"])
+
+    def test_unenrolled_device_gets_unattested_not_an_error(self):
+        # Submitting a signature for a device_id that was never enrolled
+        # must fail closed (attested=False) without crashing the login --
+        # graceful degradation, not a hard error.
+        resp = login("bob", "Manager#2026", 95, device_id="never-enrolled-device",
+                      attestation_signature="bm90LWEtcmVhbC1zaWduYXR1cmU=")
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.json()["claims"]["attested"])
 
 
 class TestAuditTrail(unittest.TestCase):

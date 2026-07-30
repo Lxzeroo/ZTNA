@@ -31,9 +31,12 @@ Network Access (ZTNA) to Secure Website Applications Based on ISO 25023"*
   network-unreachable except through the gateway.
 - **Full audit trail** -- every allow/deny decision logged; renders to a
   browsable HTML dashboard.
-- **Automated proof, not just a demo** -- 14 integration tests
+- **Cryptographic device attestation** -- resources can require proof of
+  possession of a device's enrolled key (TPM-backed on Windows), not just
+  a self-reported posture score. See `docs/DEVICE_ATTESTATION.md`.
+- **Automated proof, not just a demo** -- 19 integration tests
   (`tests/test_ztna.py`) exercise the real system end to end over real
-  HTTPS/HTTP requests. All 14 pass (`docs/TEST_RESULTS.md`).
+  HTTPS/HTTP requests. All 19 pass (`docs/TEST_RESULTS.md`).
 
 ## Quickstart (Windows)
 
@@ -48,7 +51,8 @@ Then, in a new terminal:
 ```powershell
 python -m agent.client_agent --user alice --resource docs-app --demo       # ALLOWED
 python -m agent.client_agent --user alice --resource finance-app --demo    # DENIED (role)
-python -m agent.client_agent --user bob   --resource finance-app --demo    # ALLOWED
+python -m agent.client_agent --user bob   --resource finance-app --demo    # ALLOWED (attested + healthy device)
+python -m agent.client_agent --user bob   --resource finance-app --demo --no-attestation  # DENIED (attestation_required)
 python -m agent.client_agent --user carol --resource finance-app --demo --simulate-compromised  # DENIED (device trust)
 ```
 
@@ -76,10 +80,10 @@ idp/        Identity Provider -- password + MFA -> short-lived JWT
 pdp/        Policy Decision Point -- ABAC engine (role + device trust vs. resource policy)
 gateway/    Policy Enforcement Point -- validates + authorizes + proxies + logs every request
 resources/  Two protected backends (docs-app: low sensitivity, finance-app: high sensitivity)
-agent/      Client agent: device posture check + login + resource access, incl. --watch mode
-tests/      Integration test suite (spins up all 4 services for real, 14 tests)
+agent/      Client agent: device posture check, cryptographic attestation, login + resource access, incl. --watch mode
+tests/      Integration test suite (spins up all 4 services for real, 19 tests)
 dashboard/  Generates a self-contained HTML audit dashboard from the access log
-docs/       Architecture, Windows setup guide, evaluation results, captured test run
+docs/       Architecture, device attestation design doc, Windows setup guide, evaluation results, captured test run
 ```
 
 ## Running the tests yourself
@@ -95,14 +99,19 @@ python -m dashboard.generate_dashboard
 start dashboard\dashboard.html
 ```
 
-## Known limitations
+## Known limitations (documented deliberately -- good material for a
+"future work" section in your report)
 
-1. Device trust score is self-reported by the client agent; a fully
-   compromised endpoint could lie. Production systems use external
-   attestation (MDM) instead. See `docs/ARCHITECTURE.md` Section 4.
-2. JWT uses a shared HS256 secret rather than asymmetric signing.
-3. No brute-force/rate-limiting on the IdP's `/login` endpoint.
-4. No explicit token revocation list -- mitigated, not eliminated, by the
+1. Device trust score self-report is now backed by optional cryptographic
+   attestation (`docs/DEVICE_ATTESTATION.md`) for resources that require
+   it -- but the Windows/TPM code path hasn't been run against real TPM
+   hardware yet; see that document for exactly what's verified.
+2. Attestation enrollment is trust-on-first-use (TOFU), with no
+   authenticated provisioning step -- see `docs/DEVICE_ATTESTATION.md`
+   Section 5.
+3. JWT uses a shared HS256 secret rather than asymmetric signing.
+4. No brute-force/rate-limiting on the IdP's `/login` endpoint.
+5. No explicit token revocation list -- mitigated, not eliminated, by the
    short default TTL.
 
 Each of these is a legitimate, citable extension if more scope is wanted.

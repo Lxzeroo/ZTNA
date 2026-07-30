@@ -38,6 +38,7 @@ from common.config import IDP_HOST, IDP_PORT, GATEWAY_HOST, GATEWAY_PORT
 from common.totp import current_totp
 from common.tls_utils import scheme as _tls_scheme
 from agent.device_posture import compute_trust_score
+from agent import device_attestation
 
 # Match whatever scheme the servers actually came up on (https if openssl
 # was available to generate a cert, http otherwise) -- hardcoding "https"
@@ -57,7 +58,44 @@ def _demo_secret_lookup(username: str) -> str:
     return USERS[username]["totp_secret"]
 
 
-def authenticate(username: str, password: str, demo: bool, simulate_compromised: bool):
+def _do_attestation(device_id: str):
+    """Enroll this device's attestation key (idempotent) with the IdP, then
+    complete a fresh challenge-response proving possession of the private
+    key. Returns the base64 signature to submit with /login, or None if
+    attestation could not be completed -- callers should treat None as
+    "fall back to self-reported posture only", not as a hard error, since
+    graceful degradation is a deliberate design property (see
+    docs/DEVICE_ATTESTATION.md)."""
+    try:
+        enroll_info = device_attestation.ensure_enrolled(device_id)
+        mode = enroll_info["mode"]
+        print(f"[agent] device attestation key ready (mode={mode}, "
+              f"hardware_backed={enroll_info['hardware_backed']})")
+
+        requests.post(f"{IDP_URL}/enroll", json={
+            "device_id": device_id,
+            "public_key_pem": enroll_info["public_key_pem"],
+        }, verify=False, timeout=5)
+
+        chal = requests.post(f"{IDP_URL}/challenge", json={"device_id": device_id},
+                              verify=False, timeout=5)
+        if chal.status_code != 200:
+            print(f"[agent] attestation challenge failed: {chal.status_code} {chal.text} "
+                  f"-- continuing without attestation")
+            return None
+        nonce_b64 = chal.json()["nonce"]
+
+        signature_b64 = device_attestation.sign_nonce(
+            device_id, nonce_b64, enroll_info["hardware_backed"]
+        )
+        return signature_b64
+    except Exception as e:  # noqa: BLE001
+        print(f"[agent] attestation unavailable ({e}) -- continuing without it")
+        return None
+
+
+def authenticate(username: str, password: str, demo: bool, simulate_compromised: bool,
+                  use_attestation: bool = True):
     posture = compute_trust_score(device_id=username, simulate_compromised=simulate_compromised)
     print(f"[agent] device posture check -> score={posture['score']} checks={posture['checks']}")
 
@@ -67,18 +105,24 @@ def authenticate(username: str, password: str, demo: bool, simulate_compromised:
     else:
         otp = input("Enter 6-digit authenticator code: ").strip()
 
+    device_id = device_attestation.get_local_device_id()
+    attestation_signature = _do_attestation(device_id) if use_attestation else None
+
     resp = requests.post(f"{IDP_URL}/login", json={
         "username": username,
         "password": password,
         "otp": otp,
         "device_trust_score": posture["score"],
+        "device_id": device_id,
+        "attestation_signature": attestation_signature,
     }, verify=False, timeout=5)
 
     if resp.status_code != 200:
         print(f"[agent] AUTH FAILED: {resp.status_code} {resp.json()}")
         return None
     data = resp.json()
-    print(f"[agent] authenticated OK, token expires in {data['expires_in']}s")
+    attested = data["claims"].get("attested", False)
+    print(f"[agent] authenticated OK (attested={attested}), token expires in {data['expires_in']}s")
     return data["access_token"]
 
 
@@ -91,7 +135,8 @@ def request_resource(resource: str, token: str):
 
 def run_once(args):
     password = args.password or getpass.getpass(f"Password for {args.user}: ")
-    token = authenticate(args.user, password, args.demo, args.simulate_compromised)
+    token = authenticate(args.user, password, args.demo, args.simulate_compromised,
+                          use_attestation=not args.no_attestation)
     if token is None:
         return
     status, payload = request_resource(args.resource, token)
@@ -114,7 +159,8 @@ def run_watch(args):
                 args.compromise_after > 0 and cycle >= args.compromise_after
             )
             print(f"\n--- cycle {cycle} ---")
-            token = authenticate(args.user, password, args.demo, compromised)
+            token = authenticate(args.user, password, args.demo, compromised,
+                                  use_attestation=not args.no_attestation)
             if token is not None:
                 status, payload = request_resource(args.resource, token)
                 verdict = "ALLOWED" if status == 200 else "DENIED"
@@ -138,6 +184,10 @@ def main():
     parser.add_argument("--interval", type=float, default=10.0, help="seconds between --watch cycles")
     parser.add_argument("--compromise-after", type=int, default=0,
                          help="in --watch mode, start reporting a compromised device at this cycle number")
+    parser.add_argument("--no-attestation", action="store_true",
+                         help="skip cryptographic device attestation entirely (demonstrates the "
+                              "graceful-degradation path -- finance-app requires attestation and "
+                              "will deny this login regardless of role/trust score)")
     args = parser.parse_args()
 
     if args.watch:

@@ -44,13 +44,17 @@ that it can be turned on.
 - **Identity Provider (`idp/idp_server.py`)** -- verifies password (bcrypt
   hash) + TOTP one-time code (RFC 6238, implemented from scratch in
   `common/totp.py`), accepts a self-reported device trust score from the
-  agent, and issues a signed JWT with a **45-second TTL** (configurable via
+  agent, optionally verifies a cryptographic device-attestation signature
+  (`idp/device_registry.py` -- see `docs/DEVICE_ATTESTATION.md`), and
+  issues a signed JWT with a **45-second TTL** (configurable via
   `ZTNA_TOKEN_TTL_SECONDS`).
 - **Policy Decision Point (`pdp/policy_engine.py`)** -- pure function,
   Attribute-Based Access Control: `evaluate(claims, resource) -> (allow, reason)`.
-  Checks role level against the resource's minimum, and device trust score
-  against the resource's minimum. Kept separate from the gateway so policy
-  logic is unit-testable in isolation and auditable as a single file.
+  Checks role level, self-reported device trust score, and (per-resource,
+  via `require_attestation`) a verified cryptographic attestation claim
+  against the resource's policy -- see `docs/DEVICE_ATTESTATION.md` for the
+  attestation dimension specifically. Kept separate from the gateway so
+  policy logic is unit-testable in isolation and auditable as a single file.
 - **Gateway (`gateway/gateway_server.py`)** -- the only network-facing
   Policy Enforcement Point. Validates the JWT (signature + expiry) on
   **every** request, calls the PDP, proxies to the backend only on allow,
@@ -75,6 +79,7 @@ that it can be turned on.
 | All communication secured regardless of network location | IdP + Gateway serve HTTPS with a generated cert (`common/tls_utils.py`) |
 | Access is granted per-session, not per-network-perimeter | Gateway checks every individual request against the PDP, not just at "connect time" |
 | Access determined by dynamic policy, incl. device state | PDP checks `device_trust_score`, not just identity/role |
+| Strong, verifiable subject/device identity | Optional cryptographic device attestation (`docs/DEVICE_ATTESTATION.md`) requires proof of key possession, not just a self-reported claim |
 | Continuous monitoring and verification | Short-lived tokens force periodic re-authentication; every decision is logged |
 | Strict least privilege | Per-resource `min_role_level` / `min_device_trust` thresholds; `alice` (intern) is provably blocked from `finance-app` even though she's a valid authenticated user |
 
@@ -95,13 +100,17 @@ that it can be turned on.
   everything" principle end-to-end; a production rollout would use an
   internal CA or public certs (Let's Encrypt) so clients don't need
   `verify=False`.
-- **Device trust score is self-reported by the agent.** This is the
-  single most important limitation to call out: a fully compromised
-  endpoint could tamper with `agent/device_posture.py` to report a high
-  score. Real ZTNA products solve this with remote attestation / MDM
-  integration (e.g., the endpoint's compliance state is asserted by an
-  external management platform the gateway also trusts, not by the
-  endpoint itself). Documented as future work in `docs/EVALUATION.md`.
+- **Device trust score is self-reported by the agent -- now partially
+  addressed.** This was the single most important limitation of the
+  original design: a fully compromised endpoint could tamper with
+  `agent/device_posture.py` to report a high score with nothing to check
+  it. `docs/DEVICE_ATTESTATION.md` describes a challenge-response
+  cryptographic attestation mechanism (TPM-backed on Windows) added as a
+  *second, independent* policy dimension alongside the self-reported
+  score -- resources can now require proof of key possession regardless of
+  what the posture score claims. Read that document for the honest scope
+  of what's been tested (the full protocol, via a software-key fallback)
+  versus what still needs verification on real TPM hardware.
 - **Short TTL (45s default) instead of a token-revocation list** -- avoids
   needing a shared revocation store, at the cost of up to 45 seconds of
   residual access after a device is flagged compromised. A production

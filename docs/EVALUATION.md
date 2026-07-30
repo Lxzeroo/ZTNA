@@ -7,8 +7,10 @@ project's own test suite (`tests/test_ztna.py`).
 
 ## 1. Functional suitability
 
-`python -m unittest tests.test_ztna -v` -- **14/14 tests passed** on
-2026-07-30 (full transcript in `docs/TEST_RESULTS.md`), covering:
+`python -m unittest tests.test_ztna -v` -- **19/19 tests passed** on
+2026-07-30 (full transcript in `docs/TEST_RESULTS.md`; 14 from the original
+suite plus 5 covering cryptographic device attestation, see
+`docs/DEVICE_ATTESTATION.md`), covering:
 
 - Authentication correctly accepts valid password+MFA and rejects wrong
   password, wrong OTP, and unknown users.
@@ -25,6 +27,13 @@ project's own test suite (`tests/test_ztna.py`).
 - Audit logging: every allow and deny decision produces a structured log
   line, verified by directly reading `logs/access_log.jsonl` before/after
   each test action.
+- **Cryptographic device attestation**: a login with the correct role and
+  a high self-reported trust score is still denied for a resource that
+  requires attestation, unless it also carries a verified challenge-
+  response signature over an enrolled device key; a forged or replayed
+  signature is rejected; a device that was never enrolled degrades
+  gracefully to `attested=False` instead of erroring. See
+  `docs/DEVICE_ATTESTATION.md` for the full protocol and threat model.
 
 ## 2. Performance efficiency
 
@@ -58,11 +67,20 @@ tunable in `idp/users_db.py`.
   without passing policy evaluation first.
 - **Multi-factor authentication**: real TOTP (RFC 6238), not a password
   alone.
+- **Device identity is now attestable, not just self-reported**: resources
+  can require a verified challenge-response signature over a device's
+  enrolled key (`docs/DEVICE_ATTESTATION.md`), independent of the
+  self-reported posture score, closing the specific gap called out in the
+  original evaluation. This is a trust-on-first-use (TOFU) enrollment model
+  without a full attestation certificate chain -- see that document's
+  Section 5 for the precise, honestly-scoped limitations that remain.
 - **Known gaps (see docs/ARCHITECTURE.md Section 4 for full discussion)**:
-  device trust score is self-reported by the endpoint agent rather than
-  externally attested; the IdP has no brute-force/rate-limiting protection
-  on `/login`; there is no explicit token revocation list (mitigated by the
-  short default TTL, not eliminated).
+  the IdP has no brute-force/rate-limiting protection on `/login`; there is
+  no explicit token revocation list (mitigated by the short default TTL,
+  not eliminated); the Windows/TPM attestation code path has not been
+  executed against real TPM hardware during development (see
+  `docs/DEVICE_ATTESTATION.md` Section 4 for exactly what has and hasn't
+  been verified, and the one-line command to verify it yourself).
 
 ## 4. Reliability
 

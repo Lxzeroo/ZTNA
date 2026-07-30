@@ -7,3 +7,4 @@ PyJWT==2.3.0        # short-lived signed access tokens
 bcrypt==4.*         # password hashing at rest (never store plaintext)
 requests==2.*       # HTTP client used by the client agent and test suite
 psutil==5.*         # process listing for the device-posture antivirus check
+cryptography==43.*  # device attestation: keypair generation and signature verification

@@ -58,6 +58,14 @@ def evaluate(claims: dict, resource_name: str) -> tuple:
             f"needs>={resource['min_device_trust']})"
         )
 
+    # Cryptographic device attestation is a SEPARATE, stronger dimension
+    # from the self-reported trust score above -- a resource can demand
+    # proof of key possession regardless of how healthy the device claims
+    # to be, since the score itself is just a self-report an agent could
+    # lie about. See idp/device_registry.py and docs/DEVICE_ATTESTATION.md.
+    if resource.get("require_attestation") and not claims.get("attested"):
+        return False, "attestation_required"
+
     if resource.get("business_hours_only") and not _within_business_hours():
         return False, "outside_business_hours"
 

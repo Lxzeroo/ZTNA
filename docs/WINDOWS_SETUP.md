@@ -156,7 +156,7 @@ start dashboard\dashboard.html
 ```powershell
 python -m unittest tests.test_ztna -v
 ```
-All 14 tests should pass; save the terminal output as evidence for your
+All 19 tests should pass; save the terminal output as evidence for your
 report (`docs/TEST_RESULTS.md` in this project already contains a captured
 run for reference).
 

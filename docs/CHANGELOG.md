@@ -59,3 +59,38 @@ itself and, if present, activates it inside each spawned window before
 running the service module. If no `.venv` is found, it now prints an
 explicit warning with the setup commands instead of silently failing with a
 cryptic import error four separate times.
+
+## Feature: cryptographic device attestation (replaces "trust me" posture reporting for gated resources)
+
+**Motivation:** the original design's most significant documented
+limitation was that `device_trust_score` is entirely self-reported by the
+client agent -- nothing stops a modified agent from lying about it.
+
+**What was added:** a challenge-response attestation protocol
+(`idp/device_registry.py`, `agent/device_attestation.py`) where a device
+enrolls a public key once, then proves possession of the matching private
+key on each login by signing a fresh single-use nonce. On Windows, the
+private key is generated and held inside the TPM 2.0 chip via the
+"Microsoft Platform Crypto Provider" and never leaves it; on other
+platforms (or if no TPM/provider is available), a software-key fallback is
+used automatically and clearly labeled as such (`hardware_backed: False`).
+`finance-app` now requires a verified attestation (`require_attestation:
+True` in `common/config.py`) in addition to its existing role and
+trust-score thresholds; `docs-app` still works without it, demonstrating
+graceful degradation.
+
+**Verified by:** 5 new tests in `tests/test_ztna.py::TestDeviceAttestation`
+(valid signature accepted, forged signature rejected, replayed signature
+rejected, missing attestation denied for a resource that requires it,
+unenrolled device degrades gracefully) plus updates to the 2 pre-existing
+tests that log in to `finance-app`, which now also complete attestation
+first. Full suite: 19/19 passing.
+
+**Honest scope:** the Windows/TPM-specific signing code has not been
+executed against real TPM hardware (this project was developed in a Linux
+sandbox with no TPM available) -- see `docs/DEVICE_ATTESTATION.md` Section
+4 for exactly what has and hasn't been verified, and a one-line command to
+confirm the TPM path yourself on real Windows hardware.
+
+**Full design writeup, threat model, and related-work comparison:**
+`docs/DEVICE_ATTESTATION.md`.

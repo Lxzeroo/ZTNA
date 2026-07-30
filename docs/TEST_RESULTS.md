@@ -14,6 +14,11 @@ test_wrong_otp_rejected (tests.test_ztna.TestAuthentication) ... ok
 test_wrong_password_rejected (tests.test_ztna.TestAuthentication) ... ok
 test_correct_role_but_compromised_device_is_still_denied (tests.test_ztna.TestContextAwareAccessControl) ... ok
 test_low_trust_device_denied_even_for_low_sensitivity_resource (tests.test_ztna.TestContextAwareAccessControl) ... ok
+test_attestation_signature_cannot_be_replayed (tests.test_ztna.TestDeviceAttestation) ... ok
+test_forged_attestation_signature_is_rejected (tests.test_ztna.TestDeviceAttestation) ... ok
+test_high_trust_correct_role_but_no_attestation_is_denied (tests.test_ztna.TestDeviceAttestation) ... ok
+test_unenrolled_device_gets_unattested_not_an_error (tests.test_ztna.TestDeviceAttestation) ... ok
+test_valid_attestation_signature_is_accepted (tests.test_ztna.TestDeviceAttestation) ... ok
 test_finance_manager_with_healthy_device_reaches_finance_app (tests.test_ztna.TestLeastPrivilegeAccessControl) ... ok
 test_intern_can_reach_low_sensitivity_resource (tests.test_ztna.TestLeastPrivilegeAccessControl) ... ok
 test_intern_cannot_reach_high_sensitivity_resource (tests.test_ztna.TestLeastPrivilegeAccessControl) ... ok
@@ -24,7 +29,7 @@ Proves the system re-verifies on every call instead of trusting ... ok
 test_request_for_undefined_resource_is_rejected (tests.test_ztna.TestUnknownResource) ... ok
 
 ----------------------------------------------------------------------
-Ran 14 tests in 10.110s
+Ran 19 tests in 9.779s
 
 OK
 ```
@@ -33,3 +38,9 @@ Regenerate this evidence yourself at any time with:
 ```
 python -m unittest tests.test_ztna -v
 ```
+
+Note: the 5 `TestDeviceAttestation` tests exercise the full enrollment ->
+challenge -> sign -> verify -> policy-gate protocol via the software-key
+fallback path (this environment has no TPM). See
+`docs/DEVICE_ATTESTATION.md` Section 4 for what that does and doesn't
+prove about the Windows/TPM-specific code path.

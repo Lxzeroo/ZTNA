@@ -16,13 +16,20 @@ import jwt
 from common.config import JWT_SECRET, JWT_ALGORITHM, TOKEN_TTL_SECONDS
 
 
-def issue_token(username: str, role: str, device_id: str, device_trust_score: int) -> dict:
+def issue_token(username: str, role: str, device_id: str, device_trust_score: int,
+                 attested: bool = False) -> dict:
     now = int(time.time())
     claims = {
         "sub": username,
         "role": role,
         "device_id": device_id,
         "device_trust_score": device_trust_score,
+        # True only if this login included a valid cryptographic proof of
+        # possession of the device's enrolled key (see idp/device_registry.py)
+        # -- NOT the same as the self-reported posture score above. A
+        # resource can require attested=True regardless of trust score to
+        # guarantee the identity of the device, not just its claimed health.
+        "attested": bool(attested),
         "iat": now,
         "exp": now + TOKEN_TTL_SECONDS,
     }

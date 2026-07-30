@@ -26,6 +26,7 @@ RESOURCES = {
         "sensitivity": "low",
         "min_role_level": 1,
         "min_device_trust": 50,
+        "require_attestation": False,   # graceful-degradation demo: self-report is enough here
     },
     "finance-app": {
         "host": "127.0.0.1",
@@ -33,6 +34,9 @@ RESOURCES = {
         "sensitivity": "high",
         "min_role_level": 3,
         "min_device_trust": 80,
+        "require_attestation": True,    # a self-reported score alone is not enough for this resource --
+                                         # the login must also carry a verified device-attestation signature
+                                         # (see idp/device_registry.py, docs/DEVICE_ATTESTATION.md)
     },
 }
 
