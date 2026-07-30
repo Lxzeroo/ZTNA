@@ -95,8 +95,7 @@ python -m dashboard.generate_dashboard
 start dashboard\dashboard.html
 ```
 
-## Known limitations (documented deliberately -- good material for a
-"future work" section in your report)
+## Known limitations
 
 1. Device trust score is self-reported by the client agent; a fully
    compromised endpoint could lie. Production systems use external
