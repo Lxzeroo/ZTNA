@@ -1,0 +1,9 @@
+# PyZTNA -- classroom Zero Trust Network Access implementation
+# Deliberately minimal: everything else (HTTP server, TLS, hashing
+# primitives, TOTP) is built on the Python standard library so the whole
+# project runs on a bare Windows Python 3.10+ install.
+
+PyJWT==2.3.0        # short-lived signed access tokens
+bcrypt==4.*         # password hashing at rest (never store plaintext)
+requests==2.*       # HTTP client used by the client agent and test suite
+psutil==5.*         # process listing for the device-posture antivirus check

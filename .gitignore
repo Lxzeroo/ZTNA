@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+certs/*.crt
+certs/*.key
+logs/*.jsonl
+dashboard/dashboard.html
+.venv/
+venv/
