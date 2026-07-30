@@ -39,3 +39,23 @@ demo* rather than enforced -- a production deployment should fail closed
 (refuse to start, or refuse to serve) if TLS cannot be established, rather
 than silently downgrading to plaintext HTTP. That's a legitimate follow-up
 hardening item beyond what this classroom project currently does.
+
+## Fix: run_all.ps1 spawned windows didn't inherit the activated virtualenv
+
+**Symptom:** `ModuleNotFoundError: No module named 'jwt'` (or `requests`,
+`bcrypt`, `psutil`) when running services via `.\run_all.ps1`, even after
+correctly running `pip install -r requirements.txt` inside an activated
+`.venv` in the terminal used to launch it.
+
+**Root cause:** `run_all.ps1` used `Start-Process powershell -ArgumentList
+...` to open each service in its own window. Each of those is a brand-new
+PowerShell process -- it does **not** inherit the `.venv` activation from
+the terminal that launched it, so `python` inside each spawned window
+resolved to the system-wide Python (with none of this project's
+dependencies installed), not the virtual environment's Python.
+
+**Fix:** `run_all.ps1` now checks for `.venv\Scripts\Activate.ps1` next to
+itself and, if present, activates it inside each spawned window before
+running the service module. If no `.venv` is found, it now prints an
+explicit warning with the setup commands instead of silently failing with a
+cryptic import error four separate times.
