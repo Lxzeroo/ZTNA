@@ -2,10 +2,6 @@
 Turns logs/access_log.jsonl into a single self-contained dashboard.html --
 no external CDN, no server required, just open the file in a browser.
 
-This exists to satisfy the "visibility / audit trail" pillar of Zero Trust
-(NIST SP 800-207 calls out continuous monitoring explicitly) with something
-a grader can actually look at, not just a claim in the report.
-
 Run after generating some traffic:
     python -m dashboard.generate_dashboard
 """
@@ -70,7 +66,7 @@ def build_html(events):
     )
 
     rows = []
-    for e in reversed(events[-300:]):  # most recent first, capped for a readable page
+    for e in reversed(events[-300:]):
         ts = e.get("timestamp_iso", "")
         decision = e.get("decision", "")
         css_class = {"allow": "ok", "deny": "bad", "error": "warn"}.get(decision, "")

@@ -1,0 +1,20 @@
+{
+  "_comment": "Externalized PDP policy (this hardening revision -- see docs/HARDENING.md). Editing this file and calling pdp.policy_engine.reload_policies() (or restarting the Gateway) changes enforced policy WITHOUT touching pdp/policy_engine.py. Falls back to common.config.RESOURCES for any resource/field not present here.",
+  "business_hours": { "start_hour": 0, "end_hour": 24, "_note": "end_hour=24 disables the restriction" },
+  "resources": {
+    "docs-app": {
+      "min_role_level": 1,
+      "min_device_trust": 50,
+      "require_attestation": false,
+      "require_mtls": true,
+      "business_hours_only": false
+    },
+    "finance-app": {
+      "min_role_level": 3,
+      "min_device_trust": 80,
+      "require_attestation": true,
+      "require_mtls": true,
+      "business_hours_only": false
+    }
+  }
+}

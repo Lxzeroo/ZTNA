@@ -40,11 +40,6 @@ from common.tls_utils import scheme as _tls_scheme
 from agent.device_posture import compute_trust_score
 from agent import device_attestation
 
-# Match whatever scheme the servers actually came up on (https if openssl
-# was available to generate a cert, http otherwise) -- hardcoding "https"
-# here caused SSL: WRONG_VERSION_NUMBER errors on machines without OpenSSL
-# on PATH, because the servers would silently fall back to plain HTTP while
-# this client kept trying TLS.
 _SCHEME = _tls_scheme()
 IDP_URL = f"{_SCHEME}://{IDP_HOST}:{IDP_PORT}"
 GATEWAY_URL = f"{_SCHEME}://{GATEWAY_HOST}:{GATEWAY_PORT}"
@@ -62,10 +57,7 @@ def _do_attestation(device_id: str):
     """Enroll this device's attestation key (idempotent) with the IdP, then
     complete a fresh challenge-response proving possession of the private
     key. Returns the base64 signature to submit with /login, or None if
-    attestation could not be completed -- callers should treat None as
-    "fall back to self-reported posture only", not as a hard error, since
-    graceful degradation is a deliberate design property (see
-    docs/DEVICE_ATTESTATION.md)."""
+    attestation could not be completed."""
     try:
         enroll_info = device_attestation.ensure_enrolled(device_id)
         mode = enroll_info["mode"]
@@ -185,9 +177,7 @@ def main():
     parser.add_argument("--compromise-after", type=int, default=0,
                          help="in --watch mode, start reporting a compromised device at this cycle number")
     parser.add_argument("--no-attestation", action="store_true",
-                         help="skip cryptographic device attestation entirely (demonstrates the "
-                              "graceful-degradation path -- finance-app requires attestation and "
-                              "will deny this login regardless of role/trust score)")
+                         help="skip cryptographic device attestation entirely")
     args = parser.parse_args()
 
     if args.watch:

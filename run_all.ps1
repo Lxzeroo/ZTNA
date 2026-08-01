@@ -19,13 +19,6 @@ if (-not (Test-Path $venvActivate)) {
     Write-Host ""
 }
 
-# Each Start-Process call below opens a BRAND NEW PowerShell process that
-# does NOT inherit this window's activated virtual environment. Every
-# spawned command therefore re-activates .venv itself (if present) before
-# running its service -- otherwise every window fails with
-# "ModuleNotFoundError: No module named 'jwt'" (or requests/bcrypt/psutil)
-# even if you installed dependencies correctly in the terminal you launched
-# run_all.ps1 from.
 function Start-Service-Window($moduleCmd) {
     $activatePrefix = if (Test-Path $venvActivate) { ". '$venvActivate'; " } else { "" }
     Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$root'; ${activatePrefix}$moduleCmd"

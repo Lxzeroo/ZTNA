@@ -1,10 +1,17 @@
 # PyZTNA -- classroom Zero Trust Network Access implementation
-# Deliberately minimal: everything else (HTTP server, TLS, hashing
-# primitives, TOTP) is built on the Python standard library so the whole
-# project runs on a bare Windows Python 3.10+ install.
+# Deliberately minimal: everything else (HTTP server, TLS/CA, hashing
+# primitives, TOTP, rate limiting, revocation, audit-log hash chaining) is
+# built on the Python standard library so the whole project runs on a bare
+# Windows Python 3.10+ install.
 
-PyJWT==2.3.0        # short-lived signed access tokens
+PyJWT==2.3.0        # signed access tokens (now RS256 -- see docs/HARDENING.md)
 bcrypt==4.*         # password hashing at rest (never store plaintext)
 requests==2.*       # HTTP client used by the client agent and test suite
 psutil==5.*         # process listing for the device-posture antivirus check
-cryptography==43.*  # device attestation: keypair generation and signature verification
+cryptography==43.*  # RSA keypairs for JWT signing + internal CA + device attestation
+
+# Optional, only needed if idp/auth_backends.py's LDAPAuthBackend is
+# actually selected via ZTNA_AUTH_BACKEND=ldap (default is "local" and
+# does NOT need this package). Not installed by default to keep the
+# core project dependency-minimal.
+# ldap3==2.9.*

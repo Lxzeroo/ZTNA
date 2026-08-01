@@ -1,0 +1,36 @@
+# PyZTNA -- equivalent reverse-proxy config using Caddy instead of nginx.
+# Caddy's automatic HTTPS is convenient for a real deployment with a public
+# DNS name (Let's Encrypt) -- see deploy/README.md for when to prefer this
+# over deploy/nginx.conf.
+
+ztna.example.internal {
+	reverse_proxy /access/* https://127.0.0.1:9200 {
+		transport http {
+			tls_insecure_skip_verify  # replace with `tls_trust_pool` pointed at the PyZTNA CA cert for full verification
+		}
+	}
+	reverse_proxy /health https://127.0.0.1:9200 {
+		transport http {
+			tls_insecure_skip_verify
+		}
+	}
+
+	# Basic edge rate limiting (requires the rate_limit Caddy plugin, or
+	# use Caddy's built-in `rate_limit` directive if on a version that
+	# ships it). Left as a documented pattern rather than a hard
+	# dependency, since plugin availability varies by Caddy build.
+}
+
+ztna-idp.example.internal {
+	@login path /login
+	reverse_proxy @login https://127.0.0.1:9000 {
+		transport http {
+			tls_insecure_skip_verify
+		}
+	}
+	reverse_proxy / https://127.0.0.1:9000 {
+		transport http {
+			tls_insecure_skip_verify
+		}
+	}
+}

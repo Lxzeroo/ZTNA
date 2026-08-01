@@ -5,9 +5,7 @@ standard library (hmac, hashlib, base64, struct, time).
 Written by hand instead of pulling in `pyotp` so the project demonstrates
 understanding of the MFA mechanism itself, not just a library call. It is
 interoperable with real authenticator apps (Google Authenticator, Authy,
-Microsoft Authenticator) -- you can generate a secret with
-`generate_secret()`, feed the otpauth:// URI into an authenticator app,
-and `verify_totp()` will accept the 6-digit codes it produces.
+Microsoft Authenticator).
 """
 import base64
 import hashlib

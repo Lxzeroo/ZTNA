@@ -4,8 +4,11 @@ Gateway, and protected resource apps.
 
 Deliberately built on `http.server` (Python standard library) rather than
 Flask/FastAPI so the whole project runs on a bare Windows Python install
-with only two third-party packages (PyJWT, bcrypt) -- no virtualenv-breaking
-native build steps, no version drift between components.
+with a minimal dependency list -- no virtualenv-breaking native build
+steps, no version drift between components. In a real deployment, put a
+reverse proxy (see deploy/nginx.conf, deploy/Caddyfile -- added in this
+hardening revision) in front for request-size limits and edge rate
+limiting that a full framework/WAF would otherwise provide.
 """
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,7 +23,7 @@ class JSONRequestHandler(BaseHTTPRequestHandler):
     """
 
     routes = {}          # {("GET", "/access/{resource}"): "handle_access"}
-    server_version = "PyZTNA/1.0"
+    server_version = "PyZTNA/1.1"
 
     def log_message(self, fmt, *args):
         # Quiet the default stderr access log; each service does its own
@@ -87,19 +90,29 @@ class JSONRequestHandler(BaseHTTPRequestHandler):
         self._dispatch("POST")
 
 
-def serve(handler_cls, host: str, port: int, use_tls: bool = True):
-    """Start a ThreadingHTTPServer, optionally upgraded to HTTPS in-place."""
+def serve(handler_cls, host: str, port: int, use_tls: bool = True,
+          service_name: str = None, require_client_cert: bool = False):
+    """Start a ThreadingHTTPServer, optionally upgraded to HTTPS in-place.
+
+    `service_name` (this hardening revision) selects which CA-issued
+    certificate to serve -- defaults to the handler class name if omitted.
+    `require_client_cert=True` enables mTLS: the server refuses any
+    connection that doesn't present a client cert signed by the internal
+    CA (see common/tls_utils.py, common/ca_utils.py). Used by
+    resources/docs_app.py and resources/finance_app.py so that only the
+    Gateway (the sole holder of an issued client cert) can connect at all.
+    """
     from common.tls_utils import wrap_server_socket
 
     httpd = ThreadingHTTPServer((host, port), handler_cls)
     scheme = "http"
     if use_tls:
-        if wrap_server_socket(httpd):
-            scheme = "https"
-        else:
-            print("[warn] openssl not found on PATH -- falling back to plain HTTP. "
-                  "Install OpenSSL to enable TLS for this service.")
-    print(f"[{handler_cls.__name__}] listening on {scheme}://{host}:{port}")
+        name = service_name or handler_cls.__name__.replace("Handler", "").lower()
+        wrap_server_socket(httpd, name, require_client_cert=require_client_cert)
+        scheme = "https"
+
+    mtls_note = " (mTLS client cert required)" if require_client_cert else ""
+    print(f"[{handler_cls.__name__}] listening on {scheme}://{host}:{port}{mtls_note}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
