@@ -256,10 +256,6 @@ def sign_nonce(device_id: str, nonce_b64: str, hardware_backed: bool) -> str:
         sig = _windows_sign(device_id, nonce)
         if sig is not None:
             return base64.b64encode(sig).decode("ascii")
-        # If TPM signing unexpectedly fails after a successful enrollment,
-        # fail loudly rather than silently switching keys mid-protocol --
-        # the IdP has the TPM public key on file, a software signature
-        # would not verify against it anyway.
         raise RuntimeError("TPM signing failed after successful TPM enrollment; "
                             "re-run enrollment or check TPM/provider status")
     sig = _fallback_sign(device_id, nonce)

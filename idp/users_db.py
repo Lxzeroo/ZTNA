@@ -1,26 +1,23 @@
 """
-Seed user directory for the demo Identity Provider.
+Seed user directory for the demo Identity Provider (LocalAuthBackend, the
+default -- see idp/auth_backends.py for this hardening revision's
+pluggable-backend addition).
 
 In a real deployment this would be Active Directory / Entra ID / a proper
-user store. For the classroom demo it's an in-memory dict with bcrypt
-password hashes and a per-user TOTP secret (second factor), which is enough
-to demonstrate real MFA (not a fake checkbox) end to end.
+user store (see idp/auth_backends.py:LDAPAuthBackend). For the classroom
+demo it's an in-memory dict with bcrypt password hashes and a per-user
+TOTP secret (second factor).
 
 Demo credentials (also documented in README.md):
     alice / Intern#2026     (role: intern)
     bob   / Manager#2026    (role: finance_manager)
-    carol / Manager#2026    (role: finance_manager)   -- used to demo a
-                                                          "compromised device"
-                                                          being denied despite
-                                                          having the right role
+    carol / Manager#2026    (role: finance_manager)
     admin / Admin#2026      (role: admin)
 """
 import bcrypt
 
 from common.totp import generate_secret
 
-# Fixed secrets (normally random per user / provisioned via QR code) so the
-# demo and automated tests are reproducible.
 _TOTP_SECRETS = {
     "alice": "JBSWY3DPEHPK3PXPJBSWY3DP",
     "bob":   "KRSXG5CTMVRXEZLUEB2GK43F",

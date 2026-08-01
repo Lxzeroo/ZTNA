@@ -6,25 +6,66 @@ The Gateway calls `evaluate()` on EVERY request (not just at login) with the
 claims from the caller's current access token and the resource being
 requested. This is what makes the system "zero trust": possessing a valid
 token is necessary but not sufficient -- the token's claims (role, device
-trust score) are re-checked against policy on every single call.
+trust score, attestation) are re-checked against policy on every single
+call.
 
-Policy is intentionally expressed as data (policies.json-equivalent dict
-below) rather than buried in if/else chains, so policies can be reviewed,
-diffed, and extended without touching the enforcement code in gateway/.
+Hardening revision (see docs/HARDENING.md): policy thresholds now live in
+`pdp/policies.json` (data), loaded once at import time and reloadable via
+`reload_policies()` without restarting the process. This replaces reading
+policy directly out of `common.config.RESOURCES` (still used as a
+fallback/default for anything the JSON file doesn't override), so a policy
+change no longer requires touching Python source -- policies can be
+reviewed, diffed, and updated by someone who isn't a developer.
 """
+import json
+import os
 import time
+import threading
 
-from common.config import RESOURCES, ROLE_LEVELS
+from common.config import RESOURCES, ROLE_LEVELS, POLICIES_FILE
 
-# Optional extra dimension: resources can be restricted to a time window.
-# Disabled for both demo resources by default (see RESOURCES in
-# common/config.py) but implemented here to show the engine is extensible
-# beyond role + device trust, e.g. for shift-based access.
-BUSINESS_HOURS = (0, 24)  # (start_hour, end_hour), 24 = disabled/no restriction
+_lock = threading.Lock()
+_policy_cache = {}
+_business_hours_cache = (0, 24)
+
+
+def _load_policies_from_disk() -> dict:
+    """Merge pdp/policies.json over common.config.RESOURCES. A resource
+    present only in RESOURCES (not in the JSON file) still works using its
+    config.py defaults -- the JSON file only needs to contain overrides."""
+    merged = {name: dict(policy) for name, policy in RESOURCES.items()}
+    business_hours = (0, 24)
+
+    if os.path.exists(POLICIES_FILE):
+        try:
+            with open(POLICIES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for name, overrides in data.get("resources", {}).items():
+                merged.setdefault(name, {})
+                merged[name].update({k: v for k, v in overrides.items() if not k.startswith("_")})
+            bh = data.get("business_hours")
+            if bh:
+                business_hours = (bh.get("start_hour", 0), bh.get("end_hour", 24))
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[pdp] WARNING: failed to load {POLICIES_FILE} ({e}) -- "
+                  f"falling back to common.config.RESOURCES only")
+
+    return merged, business_hours
+
+
+def reload_policies() -> None:
+    """Re-read pdp/policies.json from disk. Call this after editing the
+    file to apply changes without restarting the Gateway process."""
+    global _policy_cache, _business_hours_cache
+    with _lock:
+        _policy_cache, _business_hours_cache = _load_policies_from_disk()
+
+
+reload_policies()  # populate on first import
 
 
 def _within_business_hours() -> bool:
-    start, end = BUSINESS_HOURS
+    start, end = _business_hours_cache
     if end >= 24:
         return True
     hour = time.localtime().tm_hour
@@ -39,7 +80,9 @@ def evaluate(claims: dict, resource_name: str) -> tuple:
     can be explained precisely -- which specific policy dimension failed --
     rather than a generic "access denied".
     """
-    resource = RESOURCES.get(resource_name)
+    with _lock:
+        resource = _policy_cache.get(resource_name)
+
     if resource is None:
         return False, "unknown_resource"
 
@@ -58,11 +101,6 @@ def evaluate(claims: dict, resource_name: str) -> tuple:
             f"needs>={resource['min_device_trust']})"
         )
 
-    # Cryptographic device attestation is a SEPARATE, stronger dimension
-    # from the self-reported trust score above -- a resource can demand
-    # proof of key possession regardless of how healthy the device claims
-    # to be, since the score itself is just a self-report an agent could
-    # lie about. See idp/device_registry.py and docs/DEVICE_ATTESTATION.md.
     if resource.get("require_attestation") and not claims.get("attested"):
         return False, "attestation_required"
 
@@ -73,7 +111,8 @@ def evaluate(claims: dict, resource_name: str) -> tuple:
 
 
 def describe_policy(resource_name: str) -> dict:
-    """Expose the active policy for a resource -- used by the dashboard and
-    by `docs/EVALUATION.md` generation so the report can cite the exact
+    """Expose the active (post-merge) policy for a resource -- used by the
+    dashboard and by report generation so the report can cite the exact
     thresholds enforced, not just describe them in prose."""
-    return dict(RESOURCES.get(resource_name, {}))
+    with _lock:
+        return dict(_policy_cache.get(resource_name, {}))

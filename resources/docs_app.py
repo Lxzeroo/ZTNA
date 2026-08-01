@@ -3,10 +3,15 @@ Low-sensitivity protected resource: an internal documentation portal.
 
 Binds ONLY to 127.0.0.1 -- see docs/WINDOWS_SETUP.md for the Windows
 Firewall rule that blocks any inbound connection to this port from
-anywhere except the gateway process's own loopback call. It is never
-addressable from the client directly; every request must go through
-gateway/gateway_server.py, which is the only component that enforces
-identity + policy checks.
+anywhere except the gateway process's own loopback call.
+
+Hardening revision (see docs/HARDENING.md): now also serves TLS and
+requires a client certificate signed by the internal CA (mutual TLS) --
+see common/tls_utils.py, common/ca_utils.py. This means network-level
+isolation (firewall/loopback binding) is no longer the ONLY thing
+preventing a non-Gateway caller from reaching this resource: even a host
+that reaches this port cannot complete a TLS handshake without the
+Gateway's issued client certificate.
 """
 import os
 import sys
@@ -14,7 +19,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.http_utils import JSONRequestHandler, serve
-from common.config import RESOURCES
+from common.config import RESOURCES, MTLS_ENABLED
 
 
 class DocsAppHandler(JSONRequestHandler):
@@ -37,4 +42,6 @@ class DocsAppHandler(JSONRequestHandler):
 
 if __name__ == "__main__":
     cfg = RESOURCES["docs-app"]
-    serve(DocsAppHandler, cfg["host"], cfg["port"], use_tls=False)
+    require_mtls = MTLS_ENABLED and cfg.get("require_mtls", False)
+    serve(DocsAppHandler, cfg["host"], cfg["port"], use_tls=True,
+          service_name="docs-app", require_client_cert=require_mtls)

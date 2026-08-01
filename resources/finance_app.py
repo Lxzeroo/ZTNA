@@ -2,10 +2,11 @@
 High-sensitivity protected resource: internal financial reporting API.
 
 Same isolation model as docs_app.py -- loopback-only, reachable exclusively
-through the gateway. This resource requires BOTH a higher role
-(finance_manager+) AND a higher device trust score (see common/config.py),
-which is what the "compromised device" demo scenario in
-tests/test_ztna.py and agent/client_agent.py exercises.
+through the gateway, and (this hardening revision) additionally requires
+mutual TLS with the internal CA -- see docs/HARDENING.md. This resource
+requires BOTH a higher role (finance_manager+) AND a higher device trust
+score (see common/config.py / pdp/policies.json), which is what the
+"compromised device" demo scenario exercises.
 """
 import os
 import sys
@@ -13,7 +14,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.http_utils import JSONRequestHandler, serve
-from common.config import RESOURCES
+from common.config import RESOURCES, MTLS_ENABLED
 
 
 class FinanceAppHandler(JSONRequestHandler):
@@ -36,4 +37,6 @@ class FinanceAppHandler(JSONRequestHandler):
 
 if __name__ == "__main__":
     cfg = RESOURCES["finance-app"]
-    serve(FinanceAppHandler, cfg["host"], cfg["port"], use_tls=False)
+    require_mtls = MTLS_ENABLED and cfg.get("require_mtls", False)
+    serve(FinanceAppHandler, cfg["host"], cfg["port"], use_tls=True,
+          service_name="finance-app", require_client_cert=require_mtls)

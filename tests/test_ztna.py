@@ -4,9 +4,14 @@ the properties a Zero Trust Network Access system is supposed to guarantee.
 
 This spins up all four services (IdP, Gateway, docs-app, finance-app) as
 real subprocesses listening on real (loopback) sockets and drives them over
-real HTTPS/HTTP requests -- it is deliberately NOT a set of mocked unit
-tests, so a passing run is direct evidence the system works end to end,
-not just that individual functions return the right value in isolation.
+real HTTPS requests -- it is deliberately NOT a set of mocked unit tests.
+
+Hardening revision (see docs/HARDENING.md): the original 19 tests are
+preserved unchanged in intent (same scenarios, same expected outcomes);
+what changed underneath is RS256 signing, mTLS-protected resources, and
+the new TestHardenedTokens / TestTokenRevocation / TestRateLimiting /
+TestAuditLogIntegrity / TestPolicyExternalization / TestMTLSIsolation
+classes added at the bottom of this file.
 
 Run:
     python -m unittest tests.test_ztna -v
@@ -14,6 +19,8 @@ Run:
 """
 import json
 import os
+import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -31,15 +38,15 @@ urllib3.disable_warnings()
 
 from common.totp import current_totp
 from common.tls_utils import scheme as _tls_scheme
+from common.config import GATEWAY_CLIENT_CERT_CN, RESOURCES, CA_CERT_PATH
 from idp.users_db import USERS
 
-# Use whatever scheme the services actually come up on -- see the same fix
-# in agent/client_agent.py for why this can't be hardcoded to "https".
 _SCHEME = _tls_scheme()
 IDP_URL = f"{_SCHEME}://127.0.0.1:9000"
 GATEWAY_URL = f"{_SCHEME}://127.0.0.1:9200"
 
 _procs = {}
+_gateway_client_cert = None  # (cert_path, key_path), built once services can generate it
 
 
 def _start(mod):
@@ -51,7 +58,7 @@ def _start(mod):
     )
 
 
-def _wait_ready(url, tries=40):
+def _wait_ready_idp_gateway(url, tries=40):
     for _ in range(tries):
         try:
             r = requests.get(url, verify=False, timeout=1)
@@ -63,11 +70,50 @@ def _wait_ready(url, tries=40):
     return False
 
 
+def _wait_ready_resource(host, port, tries=40):
+    """Resources require an mTLS client cert as of this hardening
+    revision -- a plain requests.get without `cert=` would fail the TLS
+    handshake before ever reaching /health. Uses the same client cert the
+    Gateway itself uses."""
+    cert_path, key_path = _gateway_client_cert
+    url = f"https://{host}:{port}/health"
+    for _ in range(tries):
+        try:
+            r = requests.get(url, verify=False, cert=(cert_path, key_path), timeout=1)
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return False
+
+
 def setUpModule():
+    global _gateway_client_cert
+
     # Fresh audit log for this test run.
     log_path = os.path.join(PROJECT_ROOT, "logs", "access_log.jsonl")
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     open(log_path, "w").close()
+
+    # Also start fresh on revocation/token-store state between full runs.
+    # Overwrite rather than delete -- some sandboxed/managed filesystems
+    # (e.g. a locked-down CI workspace) permit truncating a file's
+    # contents but not removing the file itself; this achieves the same
+    # "fresh state" goal either way.
+    for fname in ("revoked_tokens.json", "issued_tokens.json"):
+        p = os.path.join(PROJECT_ROOT, "logs", fname)
+        if os.path.exists(p):
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("{}" if fname == "revoked_tokens.json" else "[]")
+
+    # Build (or reuse) the CA + the Gateway's mTLS client cert directly in
+    # THIS process so the test suite can talk to docs-app/finance-app the
+    # same way the Gateway does, for readiness checks and the mTLS
+    # isolation test below.
+    from common import ca_utils
+    _gateway_client_cert = ca_utils.issue_cert(GATEWAY_CLIENT_CERT_CN, is_client=True)[::-1]
+    # issue_cert returns (key_path, cert_path); readiness helper wants (cert_path, key_path)
 
     _procs["idp"] = _start("idp.idp_server")
     _procs["gateway"] = _start("gateway.gateway_server")
@@ -75,10 +121,10 @@ def setUpModule():
     _procs["finance"] = _start("resources.finance_app")
 
     ready = (
-        _wait_ready(f"{IDP_URL}/health")
-        and _wait_ready(f"{GATEWAY_URL}/health")
-        and _wait_ready("http://127.0.0.1:9101/health")
-        and _wait_ready("http://127.0.0.1:9102/health")
+        _wait_ready_idp_gateway(f"{IDP_URL}/health")
+        and _wait_ready_idp_gateway(f"{GATEWAY_URL}/health")
+        and _wait_ready_resource("127.0.0.1", 9101)
+        and _wait_ready_resource("127.0.0.1", 9102)
     )
     if not ready:
         tearDownModule()
@@ -111,10 +157,6 @@ def login(username, password, device_trust_score, otp=None, device_id=None, atte
 
 
 def enroll_and_sign(device_id):
-    """Full real protocol: enroll a fresh device key, request a challenge,
-    sign it. Returns (public_key_pem, signature_b64) using whatever
-    attestation backend is available in this environment (TPM on Windows,
-    software fallback elsewhere -- see agent/device_attestation.py)."""
     from agent import device_attestation
     info = device_attestation.ensure_enrolled(device_id)
     requests.post(f"{IDP_URL}/enroll", json={
@@ -149,15 +191,12 @@ class TestAuthentication(unittest.TestCase):
         self.assertEqual(r.json()["error"], "invalid_otp")
 
     def test_unknown_user_rejected(self):
-        r = login("mallory", "whatever", 90, otp="000000")
+        r = login("mallory-nonexistent", "whatever", 90, otp="000000")
         self.assertEqual(r.status_code, 401)
         self.assertEqual(r.json()["error"], "invalid_credentials")
 
 
 class TestLeastPrivilegeAccessControl(unittest.TestCase):
-    """Role-based least privilege: a low-privilege identity must never reach
-    a resource that requires a higher role, even with a perfectly healthy
-    device."""
 
     def test_intern_can_reach_low_sensitivity_resource(self):
         token = login("alice", "Intern#2026", 95).json()["access_token"]
@@ -172,10 +211,6 @@ class TestLeastPrivilegeAccessControl(unittest.TestCase):
         self.assertIn("insufficient_role", r.json()["reason"])
 
     def test_finance_manager_with_healthy_device_reaches_finance_app(self):
-        # finance-app requires attestation (see TestDeviceAttestation for
-        # that dimension in isolation) -- complete it here too since this
-        # test is specifically about role + trust score being sufficient,
-        # not about attestation.
         device_id = f"test-device-role-{id(self)}"
         _, signature = enroll_and_sign(device_id)
         token = login("bob", "Manager#2026", 95, device_id=device_id,
@@ -186,12 +221,8 @@ class TestLeastPrivilegeAccessControl(unittest.TestCase):
 
 
 class TestContextAwareAccessControl(unittest.TestCase):
-    """The key ZTNA property that a plain RBAC/VPN system lacks: identical
-    role does not guarantee access if the device context is untrusted."""
 
     def test_correct_role_but_compromised_device_is_still_denied(self):
-        # carol has the SAME role as bob (finance_manager) but a low
-        # device trust score -- this must be denied despite the role match.
         token = login("carol", "Manager#2026", 35).json()["access_token"]
         r = access("finance-app", token)
         self.assertEqual(r.status_code, 403)
@@ -219,10 +250,6 @@ class TestTokenIntegrityAndContinuousVerification(unittest.TestCase):
         self.assertEqual(r.json()["error"], "token_signature_invalid")
 
     def test_token_expires_and_is_rejected_after_ttl(self):
-        """Proves the system re-verifies on every call instead of trusting
-        a session indefinitely after the initial login (continuous
-        verification), by showing the SAME token that worked a moment ago
-        is refused once its short TTL elapses."""
         device_id = f"test-device-ttl-{id(self)}"
         _, signature = enroll_and_sign(device_id)
         token = login("bob", "Manager#2026", 95, device_id=device_id,
@@ -248,15 +275,8 @@ class TestUnknownResource(unittest.TestCase):
 
 
 class TestDeviceAttestation(unittest.TestCase):
-    """Cryptographic device attestation (idp/device_registry.py,
-    agent/device_attestation.py): finance-app requires a verified
-    challenge-response signature over the enrolled key, independent of the
-    self-reported device_trust_score -- this is what makes attestation a
-    materially stronger guarantee than posture self-report alone."""
 
     def test_high_trust_correct_role_but_no_attestation_is_denied(self):
-        # Role and trust score both satisfy finance-app's thresholds, but
-        # no attestation signature is submitted at all.
         token = login("bob", "Manager#2026", 95).json()["access_token"]
         r = access("finance-app", token)
         self.assertEqual(r.status_code, 403)
@@ -289,17 +309,10 @@ class TestDeviceAttestation(unittest.TestCase):
         first = login("bob", "Manager#2026", 95, device_id=device_id, attestation_signature=signature)
         self.assertTrue(first.json()["claims"]["attested"])
 
-        # Re-submit the SAME signature again -- the nonce it answered was
-        # already consumed by the first login, so this must NOT verify a
-        # second time even though the signature bytes are identical and
-        # valid in isolation.
         second = login("bob", "Manager#2026", 95, device_id=device_id, attestation_signature=signature)
         self.assertFalse(second.json()["claims"]["attested"])
 
     def test_unenrolled_device_gets_unattested_not_an_error(self):
-        # Submitting a signature for a device_id that was never enrolled
-        # must fail closed (attested=False) without crashing the login --
-        # graceful degradation, not a hard error.
         resp = login("bob", "Manager#2026", 95, device_id="never-enrolled-device",
                       attestation_signature="bm90LWEtcmVhbC1zaWduYXR1cmU=")
         self.assertEqual(resp.status_code, 200)
@@ -307,8 +320,6 @@ class TestDeviceAttestation(unittest.TestCase):
 
 
 class TestAuditTrail(unittest.TestCase):
-    """Visibility/logging is a required ZTNA pillar (NIST SP 800-207) --
-    every allow AND deny decision must be recorded."""
 
     def test_every_decision_is_logged(self):
         log_path = os.path.join(PROJECT_ROOT, "logs", "access_log.jsonl")
@@ -328,6 +339,166 @@ class TestAuditTrail(unittest.TestCase):
         decisions = [e["decision"] for e in new_events if e.get("event") == "access"]
         self.assertIn("allow", decisions)
         self.assertIn("deny", decisions)
+
+
+# ---------------------------------------------------------------------------
+# New in this hardening revision -- see docs/HARDENING.md
+# ---------------------------------------------------------------------------
+
+class TestHardenedTokens(unittest.TestCase):
+    """RS256 asymmetric signing (docs/HARDENING.md item 1)."""
+
+    def test_token_is_signed_with_rs256(self):
+        import jwt as pyjwt
+        token = login("alice", "Intern#2026", 95).json()["access_token"]
+        header = pyjwt.get_unverified_header(token)
+        self.assertEqual(header["alg"], "RS256")
+
+    def test_token_carries_a_unique_jti(self):
+        r1 = login("alice", "Intern#2026", 95).json()
+        r2 = login("alice", "Intern#2026", 95).json()
+        self.assertIn("jti", r1["claims"])
+        self.assertNotEqual(r1["claims"]["jti"], r2["claims"]["jti"])
+
+
+class TestTokenRevocation(unittest.TestCase):
+    """Explicit revocation (docs/HARDENING.md item 3)."""
+
+    def test_revoked_token_is_denied_even_though_still_unexpired(self):
+        from common import revocation
+
+        resp = login("alice", "Intern#2026", 95).json()
+        token = resp["access_token"]
+        jti = resp["claims"]["jti"]
+
+        # Works before revocation.
+        r1 = access("docs-app", token)
+        self.assertEqual(r1.status_code, 200)
+
+        revocation.revoke(jti, reason="test_revocation")
+
+        # Same still-unexpired token is now denied.
+        r2 = access("docs-app", token)
+        self.assertEqual(r2.status_code, 401)
+        self.assertEqual(r2.json()["error"], "token_revoked")
+
+    def test_revoke_by_username_finds_active_jti(self):
+        from common import revocation, token_store
+
+        resp = login("alice", "Intern#2026", 95).json()
+        jti = resp["claims"]["jti"]
+
+        active = token_store.active_jtis_for_user("alice")
+        self.assertIn(jti, active)
+
+        for j in active:
+            revocation.revoke(j, reason="test_bulk_revocation")
+        self.assertTrue(revocation.is_revoked(jti))
+
+
+class TestRateLimiting(unittest.TestCase):
+    """Login rate limiting / lockout (docs/HARDENING.md item 2). Uses a
+    disposable username so it can't lock out alice/bob/carol/admin used by
+    every other test class sharing this same IdP process."""
+
+    def test_repeated_failed_logins_trigger_lockout(self):
+        username = f"ratelimit-test-user-{id(self)}"
+        last = None
+        for _ in range(6):  # default ZTNA_LOGIN_MAX_ATTEMPTS=5
+            last = login(username, "wrong-password-always", 90, otp="000000")
+        self.assertEqual(last.status_code, 429)
+        self.assertEqual(last.json()["error"], "account_locked")
+        self.assertIn("retry_after_seconds", last.json())
+
+
+class TestAuditLogIntegrity(unittest.TestCase):
+    """Hash-chained audit log (docs/HARDENING.md item 6)."""
+
+    def test_current_log_chain_is_intact(self):
+        from common.audit_log import verify_chain
+        # Generate at least one fresh event so there's something to check.
+        token = login("alice", "Intern#2026", 95).json()["access_token"]
+        access("docs-app", token)
+
+        ok, details = verify_chain()
+        self.assertTrue(ok, details)
+        self.assertGreater(details["count"], 0)
+
+    def test_tampering_with_a_historical_line_is_detected(self):
+        from common.audit_log import read_events, verify_events_chain
+
+        events = read_events()
+        self.assertGreater(len(events), 0)
+
+        tampered = [dict(e) for e in events]
+        # Mutate a field in the middle of the chain, WITHOUT recomputing
+        # hashes -- simulating exactly the kind of after-the-fact edit the
+        # hash chain exists to catch. Appending a marker (rather than
+        # setting a fixed value) guarantees the content actually changes
+        # regardless of what the original value happened to be.
+        mid = len(tampered) // 2
+        tampered[mid]["reason"] = str(tampered[mid].get("reason", "")) + "_TAMPERED"
+
+        ok, details = verify_events_chain(tampered)
+        self.assertFalse(ok)
+        self.assertIn("break_line", details)
+
+
+class TestPolicyExternalization(unittest.TestCase):
+    """PDP policy loaded from pdp/policies.json (docs/HARDENING.md item 7)."""
+
+    def test_editing_policy_file_changes_enforcement_after_reload(self):
+        import json as _json
+        import tempfile
+        import pdp.policy_engine as pe
+
+        original_file = pe.POLICIES_FILE
+        original_cache = dict(pe._policy_cache)
+        try:
+            tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+            _json.dump({
+                "resources": {
+                    "docs-app": {
+                        "min_role_level": 1,
+                        "min_device_trust": 999,  # impossibly high -- everyone denied
+                        "require_attestation": False,
+                        "require_mtls": True,
+                    }
+                }
+            }, tmp)
+            tmp.close()
+
+            pe.POLICIES_FILE = tmp.name
+            pe.reload_policies()
+
+            allow, reason = pe.evaluate({"role": "admin", "device_trust_score": 100}, "docs-app")
+            self.assertFalse(allow)
+            self.assertIn("insufficient_device_trust", reason)
+        finally:
+            pe.POLICIES_FILE = original_file
+            pe._policy_cache = original_cache
+            os.unlink(tmp.name)
+
+
+class TestMTLSIsolation(unittest.TestCase):
+    """mTLS between Gateway and resources (docs/HARDENING.md item 5)."""
+
+    def test_direct_resource_connection_without_client_cert_is_refused(self):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE  # we don't care about the server's
+                                          # identity for this test -- we're
+                                          # checking that the SERVER refuses
+                                          # US for not presenting a client cert
+        raised = False
+        try:
+            with socket.create_connection(("127.0.0.1", 9101), timeout=3) as sock:
+                with ctx.wrap_socket(sock, server_hostname="127.0.0.1") as tls_sock:
+                    tls_sock.send(b"GET /data HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                    tls_sock.recv(100)
+        except (ssl.SSLError, ConnectionResetError, ConnectionAbortedError, OSError):
+            raised = True
+        self.assertTrue(raised, "expected the resource to refuse a connection with no client certificate")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,10 @@
-__pycache__/
+﻿__pycache__/
 *.pyc
-certs/*.crt
-certs/*.key
+certs/*
+!certs/.gitkeep
 logs/*.jsonl
+logs/revoked_tokens.json
+logs/issued_tokens.json
 dashboard/dashboard.html
 .venv/
 venv/
