@@ -19,10 +19,13 @@ from common.config import CA_CERT_PATH
 from common import ca_utils
 
 
-def ensure_service_cert(service_name: str) -> tuple:
+def ensure_service_cert(service_name: str, cert_sans=None) -> tuple:
     """Return (key_path, cert_path) for `service_name`, issuing it from the
-    internal CA if it doesn't exist yet. Idempotent."""
-    return ca_utils.issue_cert(service_name)
+    internal CA if it doesn't exist yet. Idempotent -- but note issue_cert()
+    reissues rather than reusing if the existing cert doesn't cover
+    `cert_sans`, which is what makes moving to a multi-host deployment work
+    without manually deleting stale certificates."""
+    return ca_utils.issue_cert(service_name, extra_sans=cert_sans)
 
 
 def scheme() -> str:
@@ -34,7 +37,8 @@ def scheme() -> str:
     return "https"
 
 
-def wrap_server_socket(httpd, service_name: str, require_client_cert: bool = False):
+def wrap_server_socket(httpd, service_name: str, require_client_cert: bool = False,
+                        cert_sans=None):
     """Wrap an http.server socket in TLS in-place, using a CA-issued cert
     for `service_name`. If `require_client_cert` is True, the server will
     refuse any TLS handshake that doesn't present a client certificate
@@ -46,7 +50,7 @@ def wrap_server_socket(httpd, service_name: str, require_client_cert: bool = Fal
     Returns True (kept as a bool for backward-compat call sites; TLS is
     now always available since cert generation no longer depends on an
     external tool)."""
-    key_path, cert_path = ensure_service_cert(service_name)
+    key_path, cert_path = ensure_service_cert(service_name, cert_sans=cert_sans)
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
@@ -68,6 +72,6 @@ def build_client_ssl_context(client_cert_name: str = None) -> ssl.SSLContext:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.load_verify_locations(cafile=CA_CERT_PATH)
     if client_cert_name:
-        key_path, cert_path = ensure_service_cert(client_cert_name)
+        key_path, cert_path = ca_utils.issue_cert(client_cert_name, is_client=True)
         ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
     return ctx

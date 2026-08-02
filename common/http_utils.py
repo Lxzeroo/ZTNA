@@ -91,7 +91,8 @@ class JSONRequestHandler(BaseHTTPRequestHandler):
 
 
 def serve(handler_cls, host: str, port: int, use_tls: bool = True,
-          service_name: str = None, require_client_cert: bool = False):
+          service_name: str = None, require_client_cert: bool = False,
+          cert_sans=None):
     """Start a ThreadingHTTPServer, optionally upgraded to HTTPS in-place.
 
     `service_name` (this hardening revision) selects which CA-issued
@@ -108,7 +109,8 @@ def serve(handler_cls, host: str, port: int, use_tls: bool = True,
     scheme = "http"
     if use_tls:
         name = service_name or handler_cls.__name__.replace("Handler", "").lower()
-        wrap_server_socket(httpd, name, require_client_cert=require_client_cert)
+        wrap_server_socket(httpd, name, require_client_cert=require_client_cert,
+                           cert_sans=cert_sans)
         scheme = "https"
 
     mtls_note = " (mTLS client cert required)" if require_client_cert else ""

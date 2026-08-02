@@ -32,7 +32,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.http_utils import JSONRequestHandler, serve
-from common.config import GATEWAY_HOST, GATEWAY_PORT, RESOURCES, MTLS_ENABLED, GATEWAY_CLIENT_CERT_CN
+from common.config import (GATEWAY_HOST, GATEWAY_PORT, GATEWAY_BIND_HOST, RESOURCES,
+                            MTLS_ENABLED, GATEWAY_CLIENT_CERT_CN)
 from common.jwt_utils import verify_token, TokenError
 from common.audit_log import log_event
 from common.tls_utils import build_client_ssl_context
@@ -123,4 +124,5 @@ class GatewayHandler(JSONRequestHandler):
 
 
 if __name__ == "__main__":
-    serve(GatewayHandler, GATEWAY_HOST, GATEWAY_PORT, use_tls=True, service_name="gateway")
+    serve(GatewayHandler, GATEWAY_BIND_HOST, GATEWAY_PORT, use_tls=True,
+          service_name="gateway", cert_sans=[GATEWAY_HOST])

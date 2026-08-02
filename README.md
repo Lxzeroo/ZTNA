@@ -114,10 +114,12 @@ tests/      Integration test suite (spins up all 4 services for real,
             28 tests)
 dashboard/  Generates a self-contained HTML audit dashboard from the
             access log
-tools/      Admin CLIs: revoke_token.py, verify_audit_log.py
+tools/      Admin CLIs: revoke_token.py, verify_audit_log.py,
+            provision_certs.py (multi-host PKI), network_probe.py (evidence)
 deploy/     Reverse-proxy configs (nginx/Caddy) + HA deployment notes for
             a real multi-host deployment
 docs/       Architecture, hardening pass writeup, Windows setup guide,
+            MULTI_HOST_LAB.md (real-network deployment + evidence capture),
             evaluation results, captured test runs
 ```
 
@@ -159,7 +161,10 @@ What's left, named explicitly rather than silently skipped:
    systems use external attestation (MDM) instead.
 2. Device enrollment (`idp/device_registry.py`) is trust-on-first-use --
    the first enrollment for a device_id is accepted unconditionally.
-3. No high-availability / multi-instance deployment story yet -- the
+3. No high-availability / multi-instance deployment story yet (note: running
+   across separate machines IS supported and documented in
+   `docs/MULTI_HOST_LAB.md`; what's missing is running *several instances of
+   the same component*) -- the
    revocation store, audit-log writer, and IdP's in-memory rate-limit/
    enrollment state all currently assume a single instance. See
    `deploy/README.md`'s HA section for exactly what would need to change.

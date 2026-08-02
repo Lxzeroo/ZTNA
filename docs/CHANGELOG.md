@@ -98,3 +98,53 @@ availability, but degrading a *security* control silently is a hazard in
 itself -- the deployment was weaker than it appeared and said nothing. Any
 fallback that lowers a security guarantee should be loud, and in production
 should be an auditable event rather than a log line.
+
+
+## Feature: multi-host deployment support and negative-control evidence tooling
+
+**Motivation:** every component defaulted to `127.0.0.1`, so the isolation
+claims could only be demonstrated on one machine -- where "unreachable
+except through the Gateway" is true largely because of loopback binding.
+
+**Four blockers were found and fixed** before the code could run across
+machines. Each failed silently or with a misleading error:
+
+1. Resource addresses were hardcoded to `127.0.0.1`, so the Gateway could
+   not dial a remote backend. Every host/port is now settable via
+   `ZTNA_*` environment variables, and bind address is now distinct from
+   dial address (`*_BIND_HOST` vs `*_HOST`).
+2. Each host generated its **own** internal CA on first start, so the
+   Gateway's client certificate was signed by one CA while the resource
+   trusted another -- every mTLS handshake failed.
+3. Each host generated its **own** JWT keypair, so the Gateway rejected
+   every token the IdP issued as `token_signature_invalid`.
+4. Certificates carried only `localhost` and `127.0.0.1` in
+   SubjectAltName, so TLS hostname verification failed against real
+   addresses.
+
+Blockers 2 and 3 are addressed by `tools/provision_certs.py`, which
+generates the CA and JWT keypair once and emits per-host bundles containing
+only what each host needs -- notably the Gateway receives the JWT **public**
+key only, preserving the security property that RS256 was adopted for.
+Blocker 4 is addressed by SAN support in `common/ca_utils.py`, including a
+check that reissues rather than silently reusing a certificate that does not
+cover the required names.
+
+**Added `tools/network_probe.py`** to capture negative-control evidence:
+it verifies that a direct connection to a protected resource is refused at
+the network layer (firewall) and, independently, at the TLS layer (missing
+client certificate) -- with distinct error signatures for each.
+
+**A TLS 1.3 subtlety found while building it:** under TLS 1.2 a missing
+client certificate failed during the handshake, but under TLS 1.3 the
+handshake completes and the rejection only surfaces on the first read or
+write. The first version of the probe reported "handshake OK" and therefore
+produced a false result stating that mTLS was *not* being enforced when it
+was working correctly. The probe now performs a full request/response round
+trip. The general lesson -- do not treat handshake completion as proof of
+admission -- is documented in `docs/MULTI_HOST_LAB.md` section 7.
+
+**Verified:** full suite still 28/28; additionally exercised end to end with
+services bound to `0.0.0.0` and dialled by a non-`127.0.0.1` address, with
+certificate hostname verification enabled, confirming the SAN and
+bind/dial separation work. Full guide: `docs/MULTI_HOST_LAB.md`.

@@ -13,3 +13,7 @@ logs/login_attempts.json
 dashboard/dashboard.html
 .venv/
 venv/
+
+certs/*
+!certs/.gitkeep
+dist/

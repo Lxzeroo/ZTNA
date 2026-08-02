@@ -30,7 +30,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.http_utils import JSONRequestHandler, serve
-from common.config import IDP_HOST, IDP_PORT, ROLE_LEVELS
+from common.config import IDP_HOST, IDP_PORT, IDP_BIND_HOST, ROLE_LEVELS
 from common.jwt_utils import issue_token
 from common.audit_log import log_event
 from common.totp import verify_totp
@@ -138,4 +138,5 @@ class IdPHandler(JSONRequestHandler):
 
 
 if __name__ == "__main__":
-    serve(IdPHandler, IDP_HOST, IDP_PORT, use_tls=True, service_name="idp")
+    serve(IdPHandler, IDP_BIND_HOST, IDP_PORT, use_tls=True, service_name="idp",
+          cert_sans=[IDP_HOST])

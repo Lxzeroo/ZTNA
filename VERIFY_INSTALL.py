@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Self-check that this copy of PyZTNA is the complete, correctly-wired
-v2.0.1 tree -- not a partially-updated one.
+v2.1.0 tree -- not a partially-updated one.
 
 This exists because a previous packaging mistake left the new modules in
 place while every *modified* file stayed at its pre-hardening version. The
@@ -87,7 +87,7 @@ def main():
         print("Re-copy the full project folder rather than individual files.")
         sys.exit(1)
 
-    print(f"OK -- all {total} checks passed. This is a complete, correctly-wired v2.0.1 tree.")
+    print(f"OK -- all {total} checks passed. This is a complete, correctly-wired v2.1.0 tree.")
     print("\nNext: python -m unittest tests.test_ztna -v      (expect 28 tests, OK)")
     sys.exit(0)
 

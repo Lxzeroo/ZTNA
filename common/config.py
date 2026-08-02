@@ -11,24 +11,57 @@ cert -> internal CA + mTLS, etc.).
 import os
 
 # --- Network ---
+#
+# Two distinct concepts, which only diverge once services are on separate
+# machines (see docs/MULTI_HOST_LAB.md):
+#
+#   *_HOST       the address OTHER components dial to reach this service.
+#                On a multi-host deployment this is the machine's real LAN
+#                address, because that is what a remote caller must connect to.
+#   *_BIND_HOST  the local interface the service listens on. Usually
+#                "0.0.0.0" on a multi-host deployment so the service accepts
+#                connections from other machines at all; defaults to the dial
+#                address so the single-host demo is unchanged.
+#
+# Everything below defaults to loopback, so a fresh clone still runs entirely
+# on one machine with no configuration.
 IDP_HOST = os.environ.get("ZTNA_IDP_HOST", "127.0.0.1")
 IDP_PORT = int(os.environ.get("ZTNA_IDP_PORT", "9000"))
+IDP_BIND_HOST = os.environ.get("ZTNA_IDP_BIND_HOST", IDP_HOST)
 
 GATEWAY_HOST = os.environ.get("ZTNA_GATEWAY_HOST", "127.0.0.1")
 GATEWAY_PORT = int(os.environ.get("ZTNA_GATEWAY_PORT", "9200"))
+GATEWAY_BIND_HOST = os.environ.get("ZTNA_GATEWAY_BIND_HOST", GATEWAY_HOST)
+
+DOCS_APP_HOST = os.environ.get("ZTNA_DOCS_APP_HOST", "127.0.0.1")
+DOCS_APP_PORT = int(os.environ.get("ZTNA_DOCS_APP_PORT", "9101"))
+DOCS_APP_BIND_HOST = os.environ.get("ZTNA_DOCS_APP_BIND_HOST", DOCS_APP_HOST)
+
+FINANCE_APP_HOST = os.environ.get("ZTNA_FINANCE_APP_HOST", "127.0.0.1")
+FINANCE_APP_PORT = int(os.environ.get("ZTNA_FINANCE_APP_PORT", "9102"))
+FINANCE_APP_BIND_HOST = os.environ.get("ZTNA_FINANCE_APP_BIND_HOST", FINANCE_APP_HOST)
+
+# Additional SubjectAltName entries to place on issued certificates, as a
+# comma-separated list of hostnames and/or IP addresses. Required in a
+# multi-host deployment: a certificate that only carries "localhost" and
+# 127.0.0.1 will fail hostname verification when a remote caller dials the
+# machine's real address. tools/provision_certs.py sets this for you.
+CERT_EXTRA_SANS = [
+    x.strip() for x in os.environ.get("ZTNA_CERT_SANS", "").split(",") if x.strip()
+]
 
 # Protected resources bind ONLY to loopback by default. In a multi-machine
-# deployment, change these hosts to real addresses and add the Windows
-# Firewall / iptables rules in docs/WINDOWS_SETUP.md Section 5 -- but as of
-# this hardening revision, network-level isolation is defense-in-depth,
-# not the only control: docs-app/finance-app also require a TLS client
-# certificate issued by the internal CA (mTLS), so a host that gets past
-# the firewall still cannot complete a handshake without the Gateway's
+# deployment, set the *_HOST / *_BIND_HOST variables above and add the
+# firewall rules in docs/MULTI_HOST_LAB.md -- but network-level isolation is
+# defense-in-depth, not the only control: docs-app/finance-app also require a
+# TLS client certificate issued by the internal CA (mTLS), so a host that gets
+# past the firewall still cannot complete a handshake without the Gateway's
 # client cert. See docs/HARDENING.md.
 RESOURCES = {
     "docs-app": {
-        "host": "127.0.0.1",
-        "port": 9101,
+        "host": DOCS_APP_HOST,
+        "bind_host": DOCS_APP_BIND_HOST,
+        "port": DOCS_APP_PORT,
         "sensitivity": "low",
         "min_role_level": 1,
         "min_device_trust": 50,
@@ -36,8 +69,9 @@ RESOURCES = {
         "require_mtls": True,
     },
     "finance-app": {
-        "host": "127.0.0.1",
-        "port": 9102,
+        "host": FINANCE_APP_HOST,
+        "bind_host": FINANCE_APP_BIND_HOST,
+        "port": FINANCE_APP_PORT,
         "sensitivity": "high",
         "min_role_level": 3,
         "min_device_trust": 80,

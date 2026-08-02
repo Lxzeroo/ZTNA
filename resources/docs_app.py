@@ -43,5 +43,10 @@ class DocsAppHandler(JSONRequestHandler):
 if __name__ == "__main__":
     cfg = RESOURCES["docs-app"]
     require_mtls = MTLS_ENABLED and cfg.get("require_mtls", False)
-    serve(DocsAppHandler, cfg["host"], cfg["port"], use_tls=True,
-          service_name="docs-app", require_client_cert=require_mtls)
+    # Bind to bind_host (often 0.0.0.0 on a multi-host deployment) but put the
+    # dial address in the certificate, so a remote Gateway's TLS hostname
+    # verification succeeds. See docs/MULTI_HOST_LAB.md.
+    serve(DocsAppHandler,
+          cfg.get("bind_host", cfg["host"]), cfg["port"], use_tls=True,
+          service_name="docs-app", require_client_cert=require_mtls,
+          cert_sans=[cfg["host"]])

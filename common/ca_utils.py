@@ -29,6 +29,7 @@ Windows" step from docs/WINDOWS_SETUP.md that the original design needed.
 import datetime
 import ipaddress
 import os
+import socket
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -36,7 +37,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.backends import default_backend
 from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
 
-from common.config import CA_DIR, CA_KEY_PATH, CA_CERT_PATH, SERVICE_CERT_DIR
+from common.config import CA_DIR, CA_KEY_PATH, CA_CERT_PATH, SERVICE_CERT_DIR, CERT_EXTRA_SANS
 
 _ONE_DAY = datetime.timedelta(days=1)
 
@@ -97,16 +98,98 @@ def _load_ca():
     return ca_key, ca_cert
 
 
-def issue_cert(name: str, dns_names=None, is_client: bool = False) -> tuple:
+def _san_objects(extra):
+    """Build SubjectAltName entries, classifying each string as an IP address
+    or a DNS name. Always includes localhost/127.0.0.1 so the single-host
+    demo keeps working, plus this machine's own hostname."""
+    entries = [x509.DNSName("localhost")]
+    seen_ip = set()
+    seen_dns = {"localhost"}
+
+    try:
+        host = socket.gethostname()
+        if host and host not in seen_dns:
+            entries.append(x509.DNSName(host))
+            seen_dns.add(host)
+    except Exception:
+        pass
+
+    entries.append(x509.IPAddress(ipaddress.ip_address("127.0.0.1")))
+    seen_ip.add("127.0.0.1")
+
+    for item in (extra or []):
+        item = str(item).strip()
+        if not item:
+            continue
+        try:
+            ip = ipaddress.ip_address(item)
+            if str(ip) not in seen_ip:
+                entries.append(x509.IPAddress(ip))
+                seen_ip.add(str(ip))
+        except ValueError:
+            if item not in seen_dns:
+                entries.append(x509.DNSName(item))
+                seen_dns.add(item)
+    return entries
+
+
+def _cert_covers(cert_path: str, required) -> bool:
+    """True if an existing certificate already carries every required SAN.
+
+    Without this check a cert generated during an earlier single-host run
+    (carrying only localhost/127.0.0.1) would be silently reused on a
+    multi-host deployment, and every remote TLS handshake would fail
+    hostname verification for reasons that are genuinely hard to trace back
+    to a stale file. See docs/MULTI_HOST_LAB.md.
+    """
+    try:
+        with open(cert_path, "rb") as f:
+            cert = x509.load_pem_x509_certificate(f.read(), default_backend())
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        have_dns = set(san.get_values_for_type(x509.DNSName))
+        have_ip = {str(i) for i in san.get_values_for_type(x509.IPAddress)}
+    except Exception:
+        return False
+
+    for item in (required or []):
+        item = str(item).strip()
+        if not item:
+            continue
+        try:
+            if str(ipaddress.ip_address(item)) not in have_ip:
+                return False
+        except ValueError:
+            if item not in have_dns:
+                return False
+    return True
+
+
+def issue_cert(name: str, dns_names=None, is_client: bool = False, extra_sans=None) -> tuple:
     """Issue (or reuse) a leaf cert signed by the internal CA for `name`.
+
     `is_client=True` marks it for client authentication (mTLS) rather than
     server authentication -- used for the Gateway's client identity when
-    calling docs-app/finance-app. Returns (key_path, cert_path)."""
+    calling docs-app/finance-app.
+
+    `extra_sans` adds hostnames/IPs to the SubjectAltName; anything in
+    common.config.CERT_EXTRA_SANS (the ZTNA_CERT_SANS env var) is added
+    automatically. An existing certificate is only reused if it already
+    covers every required SAN -- otherwise it is reissued, so changing the
+    deployment's addresses does not leave a stale, unusable cert behind.
+
+    Returns (key_path, cert_path).
+    """
     os.makedirs(SERVICE_CERT_DIR, exist_ok=True)
     key_path = os.path.join(SERVICE_CERT_DIR, f"{name}_key.pem")
     cert_path = os.path.join(SERVICE_CERT_DIR, f"{name}_cert.pem")
+
+    required = list(dns_names or []) + list(extra_sans or []) + list(CERT_EXTRA_SANS)
+
     if os.path.exists(key_path) and os.path.exists(cert_path):
-        return key_path, cert_path
+        if _cert_covers(cert_path, required):
+            return key_path, cert_path
+        print(f"[ca] existing certificate for '{name}' does not cover the required "
+              f"names {required} -- reissuing")
 
     ca_key, ca_cert = _load_ca()
     key = _generate_key()
@@ -116,11 +199,7 @@ def issue_cert(name: str, dns_names=None, is_client: bool = False) -> tuple:
         x509.NameAttribute(NameOID.ORGANIZATION_NAME, "PyZTNA"),
     ])
 
-    san_entries = [x509.DNSName("localhost")]
-    for dn in (dns_names or []):
-        san_entries.append(x509.DNSName(dn))
-    san_entries.append(x509.IPAddress(ipaddress.ip_address("127.0.0.1")))
-
+    san_entries = _san_objects(required)
     eku = ExtendedKeyUsageOID.CLIENT_AUTH if is_client else ExtendedKeyUsageOID.SERVER_AUTH
 
     cert = (
