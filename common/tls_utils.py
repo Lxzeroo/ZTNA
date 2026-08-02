@@ -19,10 +19,10 @@ from common.config import CA_CERT_PATH
 from common import ca_utils
 
 
-def ensure_service_cert(service_name: str, is_client: bool = False) -> tuple:
+def ensure_service_cert(service_name: str) -> tuple:
     """Return (key_path, cert_path) for `service_name`, issuing it from the
     internal CA if it doesn't exist yet. Idempotent."""
-    return ca_utils.issue_cert(service_name, is_client=is_client)
+    return ca_utils.issue_cert(service_name)
 
 
 def scheme() -> str:
@@ -68,6 +68,6 @@ def build_client_ssl_context(client_cert_name: str = None) -> ssl.SSLContext:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.load_verify_locations(cafile=CA_CERT_PATH)
     if client_cert_name:
-        key_path, cert_path = ensure_service_cert(client_cert_name, is_client=True)
+        key_path, cert_path = ensure_service_cert(client_cert_name)
         ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
     return ctx
