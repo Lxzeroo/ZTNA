@@ -175,14 +175,14 @@ addition to (not instead of) the IdP's own per-username lockout.
   commercial ZTNA product does would need a TCP-level (e.g. SNI-routed or
   SOCKS-style) broker, which is a materially larger project scoped out
   here.
-- **TPM hardware verification / real LDAP directory verification**: both
-  the device-attestation Windows/TPM path and the new
-  `LDAPAuthBackend` are structurally complete and reviewed, but neither
-  has been executed against real external infrastructure this development
-  sandbox doesn't have. Verify both yourself before citing either as a
-  tested result -- see the one-line verification commands in
-  `docs/DEVICE_ATTESTATION.md` Section 4 and this document's Section 8
-  above.
+- **Real LDAP directory verification**: `LDAPAuthBackend` is structurally
+  complete and reviewed but has not been executed against a real directory
+  server. Verify before citing it as a tested result -- see Section 8 above.
+
+  (The Windows/TPM attestation path is **no longer** in this category -- it
+  was verified on real AMD fTPM 2.0 hardware on 2026-08-02, which also
+  uncovered a .NET API-compatibility bug that had been silently degrading
+  it to a software key. See `docs/DEVICE_ATTESTATION.md` Section 4.)
 
 ## Updated test count
 

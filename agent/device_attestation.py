@@ -55,6 +55,17 @@ _DEVICE_ID_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "certs", "device_id.txt"
 )
 
+# Set ZTNA_ATTESTATION_DEBUG=1 to see the raw PowerShell output when the
+# TPM path fails. Without this the failure is silent (it degrades to a
+# software key), which made a real .NET API-compatibility bug very hard to
+# diagnose -- see docs/DEVICE_ATTESTATION.md Section 4.
+_DEBUG = os.environ.get("ZTNA_ATTESTATION_DEBUG", "") not in ("", "0", "false", "False")
+
+
+def _debug(msg):
+    if _DEBUG:
+        print(f"[attestation:debug] {msg}")
+
 
 def get_local_device_id() -> str:
     """Return this machine's persistent device identifier, creating one on
@@ -100,26 +111,37 @@ def _run_powershell(script: str, timeout: int = 20):
 # ---------------------------------------------------------------------------
 
 def _windows_ensure_and_export_public_key(device_id: str):
-    """Create the TPM-backed cert if it doesn't exist, and return its
-    public key as a standard SubjectPublicKeyInfo PEM string (the same
-    format `cryptography.hazmat.primitives.serialization.load_pem_public_key`
-    expects server-side). Returns None on any failure -- caller falls back
-    to software mode."""
+    """Create the TPM-backed cert if it doesn't exist, and return its public
+    key as a standard SubjectPublicKeyInfo PEM string.
+
+    IMPORTANT (.NET compatibility): an earlier version of this function
+    called `RSA.ExportSubjectPublicKeyInfo()` inside PowerShell. That method
+    only exists on .NET Core 3.0+ / .NET 5+ -- it is NOT present in .NET
+    Framework 4.x, which is what Windows PowerShell 5.1 (the `powershell.exe`
+    shipped with every Windows 10/11) runs on. The result was that the
+    certificate was created successfully in the TPM, the export line then
+    threw a MethodNotFound error, the script exited non-zero, and this
+    function returned None -- silently degrading a perfectly good TPM to a
+    software key on hardware that fully supported it.
+
+    We now export the raw certificate bytes (`$cert.RawData`), which is
+    available on every PowerShell version, and derive the public key on the
+    Python side with the `cryptography` library instead. Returns None on any
+    failure -- caller falls back to software mode.
+    """
     subject = _cert_subject(device_id)
+    # NOTE: no backtick line-continuations here either. Backticks are fragile
+    # when a multi-line script is passed as a single -Command argument via
+    # subprocess; each command is kept on one line instead.
     script = f'''
 $ErrorActionPreference = "Stop"
 try {{
     $subject = "{subject}"
     $cert = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object {{ $_.Subject -eq $subject }} | Select-Object -First 1
     if (-not $cert) {{
-        $cert = New-SelfSignedCertificate -Subject $subject -CertStoreLocation Cert:\\CurrentUser\\My `
-            -Provider "Microsoft Platform Crypto Provider" -KeyAlgorithm RSA -KeyLength 2048 `
-            -KeyUsage DigitalSignature -NotAfter (Get-Date).AddYears(10)
+        $cert = New-SelfSignedCertificate -Subject $subject -CertStoreLocation Cert:\\CurrentUser\\My -Provider "Microsoft Platform Crypto Provider" -KeyAlgorithm RSA -KeyLength 2048 -KeyUsage DigitalSignature -NotAfter (Get-Date).AddYears(10)
     }}
-    $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($cert)
-    $spki = $rsa.ExportSubjectPublicKeyInfo()
-    $b64 = [Convert]::ToBase64String($spki)
-    Write-Output "SPKI_B64:$b64"
+    Write-Output "CERT_B64:$([Convert]::ToBase64String($cert.RawData))"
 }} catch {{
     Write-Output "ERROR:$($_.Exception.Message)"
     exit 1
@@ -127,19 +149,31 @@ try {{
 '''
     try:
         result = _run_powershell(script)
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        _debug(f"powershell invocation raised: {e}")
         return None
 
     if result.returncode != 0:
-        return None
-    line = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
-    if not line.startswith("SPKI_B64:"):
+        _debug(f"powershell exited {result.returncode}; stdout={result.stdout!r} stderr={result.stderr!r}")
         return None
 
-    spki_der = base64.b64decode(line[len("SPKI_B64:"):])
-    pem_body = base64.b64encode(spki_der).decode("ascii")
-    wrapped = "\n".join(pem_body[i:i + 64] for i in range(0, len(pem_body), 64))
-    return f"-----BEGIN PUBLIC KEY-----\n{wrapped}\n-----END PUBLIC KEY-----\n"
+    line = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+    if not line.startswith("CERT_B64:"):
+        _debug(f"unexpected powershell output: {result.stdout!r}")
+        return None
+
+    try:
+        from cryptography import x509
+        cert_der = base64.b64decode(line[len("CERT_B64:"):])
+        cert_obj = x509.load_der_x509_certificate(cert_der, default_backend())
+        pem = cert_obj.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        return pem.decode("ascii")
+    except Exception as e:  # noqa: BLE001
+        _debug(f"failed to parse certificate returned by powershell: {e}")
+        return None
 
 
 def _windows_sign(device_id: str, nonce: bytes):
@@ -165,12 +199,15 @@ try {{
 '''
     try:
         result = _run_powershell(script)
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        _debug(f"powershell invocation raised during signing: {e}")
         return None
     if result.returncode != 0:
+        _debug(f"signing powershell exited {result.returncode}; stdout={result.stdout!r} stderr={result.stderr!r}")
         return None
     line = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
     if not line.startswith("SIG_B64:"):
+        _debug(f"unexpected signing output: {result.stdout!r}")
         return None
     return base64.b64decode(line[len("SIG_B64:"):])
 

@@ -73,14 +73,61 @@ Platform Crypto Provider" Key Storage Provider via PowerShell's
 on any non-Windows machine, or on Windows if the TPM/provider is
 unavailable. `hardware_backed: False` for this path.
 
-**What has actually been verified:** the full protocol has been tested
-end-to-end via the software fallback path (see `tests/test_ztna.py`,
-`TestDeviceAttestation`). The Windows/TPM-specific code has NOT been
-executed against real TPM hardware. Verify on real hardware with:
+**What has actually been verified.** Both paths are now confirmed working.
+
+*Software fallback path:* the full protocol -- enrollment, challenge
+issuance, signing, verification, replay prevention, forgery rejection and
+policy gating -- is exercised end to end by `tests/test_ztna.py`
+(`TestDeviceAttestation`, 5 tests), which run on any platform.
+
+*Windows / TPM path: VERIFIED on real hardware (2026-08-02).*
+
+| | |
+|---|---|
+| TPM | AMD firmware TPM 2.0, ManufacturerVersion 3.87.0.5, PPI 1.3 |
+| State | `TpmPresent: True`, `TpmReady: True`, `TpmEnabled: True`, `TpmActivated: True` |
+| Shell | Windows PowerShell 5.1 (build 26100.8875) -- i.e. .NET Framework, not .NET Core |
+| Result | `{'hardware_backed': True, 'mode': 'tpm'}` |
+
+Reproduce with:
 
 ```powershell
+$env:ZTNA_ATTESTATION_DEBUG=1
 python -c "from agent.device_attestation import ensure_enrolled; print(ensure_enrolled('verify-tpm-test'))"
 ```
+
+**Privilege requirements (measured, not assumed).** Creating the TPM-bound
+key was performed in an **elevated** PowerShell. Once the key exists, a
+**non-elevated** process reuses it successfully and returns the *same*
+public key -- confirming that day-to-day operation does not require
+administrator rights. This mirrors how commercial MDM-managed attestation
+is deployed: a privileged one-time provisioning step, then unprivileged
+use. Whether *initial creation* also succeeds unprivileged was not tested,
+since the key already existed by that point; assume elevation is needed for
+enrollment unless you verify otherwise.
+
+**A bug this verification exposed, and why it matters.** The first attempts
+against this same working TPM all fell back to a software key. Two defects
+were stacked:
+
+1. The PowerShell helper called `RSA.ExportSubjectPublicKeyInfo()`. That
+   method was introduced in .NET Core 3.0 and **does not exist in .NET
+   Framework 4.x**, which is what Windows PowerShell 5.1 -- the
+   `powershell.exe` present on every Windows 10/11 install -- runs on. The
+   certificate was created correctly inside the TPM; the very next line
+   threw `MethodNotFound`; the script exited non-zero. The export now uses
+   `$cert.RawData`, available on every PowerShell version, and derives the
+   public key on the Python side with the `cryptography` library.
+2. That failure was **silent**. The graceful-degradation design caught the
+   error and quietly produced a software key, so a fully capable TPM looked
+   indistinguishable from absent hardware. `ZTNA_ATTESTATION_DEBUG=1` now
+   surfaces the underlying PowerShell error.
+
+The second defect is the more interesting one for the report: fail-safe
+degradation is correct behaviour for availability, but silent degradation
+of a *security* property is dangerous -- the system was weaker than it
+appeared, and reported nothing. Degradation should be loud and, in a
+production deployment, should itself be an auditable event.
 
 ## 5. Security analysis
 

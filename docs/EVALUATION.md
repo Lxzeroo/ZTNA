@@ -42,8 +42,12 @@ opens a fresh connection per request currently -- see docs/HARDENING.md
   `127.0.0.1` only, now additionally protected by mTLS at the application
   layer, not just network/firewall isolation.
 - **Multi-factor authentication**: unchanged -- real TOTP (RFC 6238).
-- **Device identity attestation**: unchanged from the previous revision;
-  see `docs/DEVICE_ATTESTATION.md`.
+- **Device identity attestation**: now verified end to end on real TPM 2.0
+  hardware (AMD fTPM 3.87.0.5), not only via the software fallback --
+  `hardware_backed: True`. Reaching that result also exposed a .NET
+  API-compatibility defect that had been silently degrading the TPM path to
+  a software key on every Windows PowerShell 5.1 host. See
+  `docs/DEVICE_ATTESTATION.md` Section 4 and `docs/CHANGELOG.md`.
 - **Remaining known gaps**: see `docs/HARDENING.md`'s "not addressed in
   this pass" section -- TOFU device enrollment, full HA/multi-instance
   deployment, and TCP-level (non-HTTP) resource brokering are still future

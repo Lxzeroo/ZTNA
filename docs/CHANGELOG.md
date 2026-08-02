@@ -54,3 +54,47 @@ None of these change the externally-observed behavior of the demo
 scenarios in `README.md` -- the same `--demo` commands still produce the
 same ALLOW/DENY outcomes. What changes is what's now cryptographically or
 operationally enforced underneath.
+
+
+## Fix: TPM attestation silently degraded to a software key on all Windows PowerShell 5.1 hosts
+
+**Symptom:** on a machine with a healthy, enabled TPM 2.0,
+`ensure_enrolled()` always returned
+`{'hardware_backed': False, 'mode': 'software_fallback'}`. No error was
+shown beyond the routine fallback warning, so the system appeared to be
+working while providing a materially weaker guarantee than it claimed.
+
+**Root cause:** `agent/device_attestation.py` asked PowerShell to export
+the public key with `RSA.ExportSubjectPublicKeyInfo()`. That method arrived
+in .NET Core 3.0 and is **absent from .NET Framework 4.x**, which is what
+Windows PowerShell 5.1 runs on -- and 5.1 is the `powershell.exe` shipped
+with every Windows 10/11 machine. The TPM-bound certificate was created
+successfully; the export line then threw `MethodNotFound`; the script
+exited non-zero; the caller treated that as "no TPM available".
+
+Confirmed by running the same `New-SelfSignedCertificate` command manually
+(succeeded, returning a thumbprint) and then
+`[System.Security.Cryptography.RSA]::Create().ExportSubjectPublicKeyInfo()`
+(method not found) on PowerShell 5.1.
+
+**Fix:** export the raw certificate bytes via `$cert.RawData` -- available
+on every PowerShell version -- and derive the SubjectPublicKeyInfo on the
+Python side using the `cryptography` library, which is already a required
+dependency. Backtick line-continuations were also removed from the embedded
+scripts, as they are fragile when a multi-line script is passed as a single
+`-Command` argument through `subprocess`.
+
+**Also added:** `ZTNA_ATTESTATION_DEBUG=1` now prints the underlying
+PowerShell stdout/stderr on failure. The original bug was hard to find
+precisely because the failure path was silent.
+
+**Verified by:** `hardware_backed: True, mode: tpm` on AMD firmware TPM 2.0
+(ManufacturerVersion 3.87.0.5) under Windows PowerShell 5.1, elevated for
+key creation and non-elevated for subsequent reuse. Full suite still
+28/28. See `docs/DEVICE_ATTESTATION.md` Section 4.
+
+**Takeaway for the report:** graceful degradation is the right instinct for
+availability, but degrading a *security* control silently is a hazard in
+itself -- the deployment was weaker than it appeared and said nothing. Any
+fallback that lowers a security guarantee should be loud, and in production
+should be an auditable event rather than a log line.
