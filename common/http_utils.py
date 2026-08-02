@@ -23,7 +23,7 @@ class JSONRequestHandler(BaseHTTPRequestHandler):
     """
 
     routes = {}          # {("GET", "/access/{resource}"): "handle_access"}
-    server_version = "PyZTNA/1.1"
+    server_version = "PyZTNA/2.0"
 
     def log_message(self, fmt, *args):
         # Quiet the default stderr access log; each service does its own
