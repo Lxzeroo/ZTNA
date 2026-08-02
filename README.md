@@ -1,5 +1,7 @@
 # PyZTNA -- A Zero Trust Network Access Implementation (Windows)
 
+**Current release: [v2.0.0](https://github.com/Lxzeroo/ZTNA/releases/tag/v2.0.0)** -- security hardening pass (RS256 tokens, mutual TLS, revocation, rate limiting, tamper-evident audit log). Breaking change from v1.x: the token format and the mTLS requirement on protected resources are not backward compatible. Full drawback -> fix -> verification mapping in [`docs/HARDENING.md`](docs/HARDENING.md).
+
 A from-scratch, working ZTNA system: identity provider with real MFA,
 a policy decision point, a policy-enforcing gateway, two protected
 resources, a client agent with device posture checking, an audit log, and
