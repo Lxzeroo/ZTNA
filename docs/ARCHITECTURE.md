@@ -100,4 +100,4 @@ and multi-instance Gateway guidance.
 
 See `docs/HARDENING.md` for a full, itemized mapping of every gap
 identified in Section 4 (and the README's "Known limitations") to what was
-implemented, how to exercise it, and what remains explicitly out of scope.
+implemented, how to exercise it, and what remains explicitly out of scopes.
