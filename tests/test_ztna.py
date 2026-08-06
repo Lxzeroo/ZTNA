@@ -660,22 +660,64 @@ class TestPolicyExternalization(unittest.TestCase):
 class TestMTLSIsolation(unittest.TestCase):
     """mTLS between Gateway and resources (docs/HARDENING.md item 5)."""
 
+   
     def test_direct_resource_connection_without_client_cert_is_refused(self):
+        """A client without the Gateway's certificate must never access /data.
+
+        TLS stacks differ slightly in where an mTLS rejection becomes visible:
+        some raise during the handshake, some on the first write/read, and some
+        close the connection without returning application data.
+
+        The security invariant is therefore that an unauthenticated TLS client
+        must never receive a successful HTTP response from the resource.
+        """
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE  # we don't care about the server's
-                                          # identity for this test -- we're
-                                          # checking that the SERVER refuses
-                                          # US for not presenting a client cert
-        raised = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        response = b""
+
         try:
-            with socket.create_connection(("127.0.0.1", 9101), timeout=3) as sock:
-                with ctx.wrap_socket(sock, server_hostname="127.0.0.1") as tls_sock:
-                    tls_sock.send(b"GET /data HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-                    tls_sock.recv(100)
-        except (ssl.SSLError, ConnectionResetError, ConnectionAbortedError, OSError):
-            raised = True
-        self.assertTrue(raised, "expected the resource to refuse a connection with no client certificate")
+            with socket.create_connection(
+                ("127.0.0.1", 9101),
+                timeout=3,
+            ) as sock:
+                with ctx.wrap_socket(
+                    sock,
+                    server_hostname="127.0.0.1",
+                ) as tls_sock:
+
+                    tls_sock.settimeout(3)
+
+                    tls_sock.sendall(
+                        b"GET /data HTTP/1.1\r\n"
+                        b"Host: 127.0.0.1\r\n"
+                        b"Connection: close\r\n"
+                        b"\r\n"
+                    )
+
+                    response = tls_sock.recv(4096)
+
+        except (
+            ssl.SSLError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+            BrokenPipeError,
+            TimeoutError,
+            OSError,
+        ):
+            # Expected: resource rejected the unauthenticated client.
+            return
+
+        # Some TLS implementations report rejection as a clean EOF.
+        if response == b"":
+            return
+
+        self.fail(
+            "resource returned application data to a client "
+            "that did not present a client certificate: "
+            f"{response[:200]!r}"
+        )
 
 
 class TestDeviceApproval(unittest.TestCase):
