@@ -1,7 +1,7 @@
 # PyZTNA — A Zero Trust Network Access Implementation (Windows)
 
 Repo: https://github.com/Lxzeroo/ZTNA
-Current release: **v2.0.0** — security hardening pass (RS256 tokens, mutual TLS, revocation, rate limiting, tamper-evident audit log)
+Current release: **v2.1.0** — security hardening pass (RS256 tokens, mutual TLS, revocation, rate limiting, tamper-evident audit log)
 
 > This document was written by pulling the actual repo source (not just the GitHub page) and tracing each claim to code, so what follows is verified against `common/`, `idp/`, `gateway/`, `tests/`, and `docs/` — not just restated from the project description.
 
