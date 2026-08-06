@@ -33,11 +33,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.http_utils import JSONRequestHandler, serve
 from common.config import (GATEWAY_HOST, GATEWAY_PORT, GATEWAY_BIND_HOST, RESOURCES,
-                            MTLS_ENABLED, GATEWAY_CLIENT_CERT_CN)
+                            MTLS_ENABLED, GATEWAY_CLIENT_CERT_CN, CORRELATION_HEADER)
 from common.jwt_utils import verify_token, TokenError
 from common.audit_log import log_event
 from common.tls_utils import build_client_ssl_context
-from common import revocation
+from common import revocation, obs, token_binding
+from common.token_binding import ProofError
 from pdp.policy_engine import evaluate
 
 # Built once at import time: the Gateway's own mTLS client identity for
@@ -52,7 +53,11 @@ def _proxy_to_backend(resource: dict, method: str = "GET"):
     ctx = _MTLS_CLIENT_CTX if require_mtls else _PLAIN_TLS_CLIENT_CTX
     conn = http.client.HTTPSConnection(resource["host"], resource["port"], timeout=5, context=ctx)
     try:
-        conn.request(method, "/data")
+        # Forward the correlation id so the backend's logs join up with ours.
+        # Without this the trail dies at the Gateway and the final hop -- the
+        # one that actually touched the data -- is unattributable.
+        conn.request(method, "/data",
+                     headers={CORRELATION_HEADER: obs.get_correlation_id()})
         resp = conn.getresponse()
         raw = resp.read()
         try:
@@ -95,8 +100,32 @@ class GatewayHandler(JSONRequestHandler):
         if revocation.is_revoked(claims.get("jti")):
             log_event(event="access", resource=resource_name, source_ip=client_ip,
                       decision="deny", reason="token_revoked",
-                      username=claims.get("sub"), device_id=claims.get("device_id"))
+                      username=claims.get("sub"), device_id=claims.get("device_id"),
+                      correlation_id=obs.get_correlation_id())
             return 401, {"error": "token_revoked"}
+
+        # Token binding: a token carrying a `cnf` claim may only be used by
+        # something that can prove possession of the matching device key.
+        # Checked BEFORE policy evaluation, because "who is really calling"
+        # logically precedes "may they do this" -- and evaluating policy for
+        # a caller we have not authenticated wastes work and muddies the log.
+        if token_binding.token_requires_proof(claims):
+            try:
+                token_binding.verify_proof(
+                    claims,
+                    method="GET",
+                    path=self.path.split("?", 1)[0],
+                    proof_b64=self.headers.get(token_binding.PROOF_HEADER, ""),
+                    proof_data_b64=self.headers.get(token_binding.PROOF_DATA_HEADER, ""),
+                )
+            except ProofError as e:
+                log_event(event="access", resource=resource_name, source_ip=client_ip,
+                          decision="deny", reason=str(e),
+                          username=claims.get("sub"), device_id=claims.get("device_id"),
+                          correlation_id=obs.get_correlation_id())
+                return 401, {"error": str(e),
+                             "detail": "This token is bound to a device key; a valid "
+                                       "X-Device-Proof header is required."}
 
         allow, reason = evaluate(claims, resource_name)
 
@@ -106,9 +135,21 @@ class GatewayHandler(JSONRequestHandler):
             username=claims.get("sub"), role=claims.get("role"),
             device_id=claims.get("device_id"),
             device_trust_score=claims.get("device_trust_score"),
+            correlation_id=obs.get_correlation_id(),
         )
 
         if not allow:
+            # Step-up is a denial the client can actually DO something about,
+            # so it gets its own status and a machine-readable marker rather
+            # than being flattened into a generic 403. 401 (not 403) because
+            # the correct client response is to re-authenticate.
+            if reason.startswith("step_up_required"):
+                return 401, {
+                    "error": "step_up_required",
+                    "reason": reason,
+                    "detail": ("This resource requires a recent authentication. "
+                               "Re-authenticate with MFA and retry."),
+                }
             return 403, {"error": "access_denied", "reason": reason}
 
         resource = RESOURCES[resource_name]

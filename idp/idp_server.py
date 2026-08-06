@@ -30,11 +30,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.http_utils import JSONRequestHandler, serve
-from common.config import IDP_HOST, IDP_PORT, IDP_BIND_HOST, ROLE_LEVELS
+from common.config import (IDP_HOST, IDP_PORT, IDP_BIND_HOST, ROLE_LEVELS,
+                            TOKEN_BINDING_ENABLED)
 from common.jwt_utils import issue_token
 from common.audit_log import log_event
 from common.totp import verify_totp
-from common import rate_limiter
+from common import rate_limiter, obs
 from idp.auth_backends import get_backend
 from idp import device_registry
 
@@ -56,10 +57,39 @@ class IdPHandler(JSONRequestHandler):
         public_key_pem = body.get("public_key_pem", "")
         if not device_id or not public_key_pem:
             return 400, {"error": "device_id_and_public_key_required"}
-        device_registry.register_device(device_id, public_key_pem)
+
+        try:
+            record = device_registry.register_device(device_id, public_key_pem)
+        except ValueError as e:
+            # Malformed key material -- reject rather than storing something
+            # unusable that fails confusingly at attestation time instead.
+            log_event(event="device_enrollment", device_id=device_id, source_ip=client_ip,
+                      decision="deny", reason="invalid_public_key")
+            return 400, {"error": "invalid_public_key", "detail": str(e)}
+
+        status = record["status"]
+        # An enrollment that lands in `pending` is NOT a success from the
+        # caller's point of view, and reporting 200 "enrolled" would let an
+        # agent believe it is attested when it is not -- precisely the silent
+        # security degradation docs/CHANGELOG.md warns about. 202 Accepted
+        # says "received, not yet in force".
         log_event(event="device_enrollment", device_id=device_id, source_ip=client_ip,
-                  decision="allow", reason="enrolled")
-        return 200, {"status": "enrolled", "device_id": device_id}
+                  decision="allow" if status == device_registry.STATUS_APPROVED else "pending",
+                  reason=f"enrolled_{status}", thumbprint=record["thumbprint"][:16])
+
+        if status == device_registry.STATUS_APPROVED:
+            return 200, {"status": "enrolled", "device_id": device_id,
+                         "approval_status": status, "thumbprint": record["thumbprint"]}
+        return 202, {
+            "status": "pending_approval",
+            "device_id": device_id,
+            "approval_status": status,
+            "thumbprint": record["thumbprint"],
+            "detail": ("Device enrolled but awaiting administrator approval. "
+                       "Attested logins are refused until then. "
+                       "An administrator approves with: "
+                       f"python -m tools.manage_devices --approve {device_id}"),
+        }
 
     def handle_challenge(self, params, body):
         device_id = body.get("device_id", "")
@@ -121,18 +151,36 @@ class IdPHandler(JSONRequestHandler):
         if attestation_signature:
             attested = device_registry.verify_and_consume(device_id, attestation_signature)
 
+        # 5) Token binding: pin the token to this device's key, but only if
+        #    the device is enrolled AND approved. Binding a token to a key
+        #    the Gateway will not accept would lock the user out with a
+        #    confusing error rather than failing at enrollment where the
+        #    real problem is.
+        cnf_jkt = None
+        if TOKEN_BINDING_ENABLED:
+            record = device_registry.get_device(device_id)
+            if record and record.get("status") == device_registry.STATUS_APPROVED:
+                cnf_jkt = record.get("thumbprint")
+
+        amr = ["pwd", "otp"]
+        if attested:
+            amr.append("device")
+
         token_data = issue_token(
             username=username,
             role=role,
             device_id=device_id,
             device_trust_score=int(device_trust_score),
             attested=attested,
+            cnf_jkt=cnf_jkt,
+            amr=amr,
         )
 
         log_event(event="authentication", username=username, source_ip=client_ip,
                   decision="allow", reason="mfa_ok", role=role, role_level=ROLE_LEVELS.get(role, 0),
                   device_id=device_id, device_trust_score=int(device_trust_score), attested=attested,
-                  jti=token_data["claims"]["jti"])
+                  jti=token_data["claims"]["jti"], token_bound=bool(cnf_jkt),
+                  correlation_id=obs.get_correlation_id())
 
         return 200, token_data
 

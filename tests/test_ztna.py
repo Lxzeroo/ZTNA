@@ -17,12 +17,14 @@ Run:
     python -m unittest tests.test_ztna -v
     (or, if pytest is installed:  pytest tests/test_ztna.py -v)
 """
+import atexit
 import json
 import os
 import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
@@ -46,16 +48,83 @@ IDP_URL = f"{_SCHEME}://127.0.0.1:9000"
 GATEWAY_URL = f"{_SCHEME}://127.0.0.1:9200"
 
 _procs = {}
+_service_logs = {}  # module name -> captured stdout/stderr file path
+_log_handles = []   # kept alive so the OS handles outlive the subprocesses
 _gateway_client_cert = None  # (cert_path, key_path), built once services can generate it
 
 
 def _start(mod):
-    return subprocess.Popen(
+    """Launch a service subprocess.
+
+    stdout/stderr go to a temporary FILE, not a PIPE. This is not cosmetic.
+    A pipe nobody reads has a finite buffer -- about 4 KB on Windows, 64 KB
+    on Linux -- and once it fills, the child blocks forever inside write().
+    The service simply stops answering, and every subsequent request fails
+    with a connection timeout pointing at the network rather than at the
+    real cause. A file has no such limit, and unlike DEVNULL it keeps the
+    output available for diagnosing a service that failed to start.
+    """
+    fd, path = tempfile.mkstemp(prefix="ztna-test-",
+                                suffix=f"-{mod.replace('.', '_')}.log")
+    os.close(fd)
+    _service_logs[mod] = path
+    # Open a plain file object we control the lifetime of. NamedTemporaryFile
+    # would be garbage-collected the moment this function returns, closing the
+    # handle and emitting a ResourceWarning.
+    log_handle = open(path, "w", encoding="utf-8", errors="replace")
+    _log_handles.append(log_handle)
+    proc = subprocess.Popen(
         [sys.executable, "-u", "-m", mod],
         cwd=PROJECT_ROOT,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        stdout=log_handle, stderr=subprocess.STDOUT, text=True,
         env=os.environ.copy(),
     )
+    proc._ztna_log_path = path
+    return proc
+
+
+def _assert_ports_free(ports):
+    """Refuse to run if a previous run left services holding our ports.
+
+    Without this the suite is actively misleading. On Windows a fresh
+    service can bind a port that a stale process already holds (see
+    common/http_utils._ExclusiveThreadingHTTPServer), so requests get split
+    between the new process and the old one and the run fails intermittently
+    somewhere unrelated. Better to stop here and say exactly what is wrong.
+    """
+    busy = []
+    for port in ports:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            if s.connect_ex(("127.0.0.1", port)) == 0:
+                busy.append(port)
+    if busy:
+        ports_list = ", ".join(str(p) for p in busy)
+        raise RuntimeError(
+            f"\n\nPort(s) already in use: {ports_list}\n"
+            f"A PyZTNA service from an earlier run is still running -- most likely\n"
+            f"that run was interrupted with Ctrl+C before it could shut down.\n\n"
+            f"Windows:\n"
+            f"  Get-Process python | Stop-Process        # or, more surgically:\n"
+            f"  Get-NetTCPConnection -LocalPort {busy[0]} | Select-Object OwningProcess\n"
+            f"  Stop-Process -Id <pid>\n\n"
+            f"Linux/macOS:\n"
+            f"  lsof -ti :{busy[0]} | xargs kill\n"
+        )
+
+
+def _dump_service_logs():
+    """Print captured service output. Called when startup fails, since the
+    reason is almost always in there (a preflight refusal, a port already in
+    use, a missing certificate)."""
+    for mod, path in _service_logs.items():
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read().strip()
+        except OSError:
+            continue
+        if content:
+            print(f"\n----- {mod} output -----\n{content}", file=sys.stderr)
 
 
 def _wait_ready_idp_gateway(url, tries=40):
@@ -115,6 +184,14 @@ def setUpModule():
     _gateway_client_cert = ca_utils.issue_cert(GATEWAY_CLIENT_CERT_CN, is_client=True)[::-1]
     # issue_cert returns (key_path, cert_path); readiness helper wants (cert_path, key_path)
 
+    # Check BEFORE starting anything -- a stale service on one of these ports
+    # would otherwise silently serve some of our requests.
+    _assert_ports_free([9000, 9200, 9101, 9102])
+
+    # Ctrl+C during a long run must not orphan the services; without this the
+    # next run inherits four zombies holding the ports.
+    atexit.register(tearDownModule)
+
     _procs["idp"] = _start("idp.idp_server")
     _procs["gateway"] = _start("gateway.gateway_server")
     _procs["docs"] = _start("resources.docs_app")
@@ -127,20 +204,53 @@ def setUpModule():
         and _wait_ready_resource("127.0.0.1", 9102)
     )
     if not ready:
+        _dump_service_logs()
         tearDownModule()
-        raise RuntimeError("one or more ZTNA services failed to start within the timeout")
+        raise RuntimeError("one or more ZTNA services failed to start within the timeout "
+                           "-- see the captured service output above")
 
 
 def tearDownModule():
-    for p in _procs.values():
-        p.terminate()
+    """Stop every service and release its port.
+
+    Registered with atexit as well as being called by unittest, because a
+    Ctrl+C during a long run otherwise leaves four services holding ports
+    9000/9200/9101/9102 -- which then breaks the *next* run in a way that
+    looks nothing like the actual cause. Idempotent, so being called twice
+    is harmless.
+    """
+    for p in list(_procs.values()):
+        if p.poll() is not None:
+            continue
+        try:
+            p.terminate()
+        except OSError:
+            pass
     time.sleep(0.3)
-    for p in _procs.values():
+    for p in list(_procs.values()):
         try:
             p.communicate(timeout=3)
         except Exception:
-            p.kill()
-            p.communicate()
+            try:
+                p.kill()
+                p.communicate(timeout=3)
+            except Exception:
+                pass
+    _procs.clear()
+
+    for handle in _log_handles:
+        try:
+            handle.close()
+        except OSError:
+            pass
+    _log_handles.clear()
+
+    for path in list(_service_logs.values()):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    _service_logs.clear()
 
 
 def login(username, password, device_trust_score, otp=None, device_id=None, attestation_signature=None):
@@ -156,21 +266,88 @@ def login(username, password, device_trust_score, otp=None, device_id=None, atte
     return requests.post(f"{IDP_URL}/login", json=body, verify=False, timeout=5)
 
 
-def enroll_and_sign(device_id):
+def enroll_only(device_id):
+    """Enroll a device WITHOUT approving it. Returns (public_key_pem, response).
+
+    Separated from enroll_and_sign() so tests can exercise the pending state
+    on its own -- an enrolled-but-unapproved device is now a distinct,
+    security-relevant condition rather than an intermediate step nobody sees.
+    """
     from agent import device_attestation
     info = device_attestation.ensure_enrolled(device_id)
-    requests.post(f"{IDP_URL}/enroll", json={
+    resp = requests.post(f"{IDP_URL}/enroll", json={
         "device_id": device_id, "public_key_pem": info["public_key_pem"],
     }, verify=False, timeout=5)
+    return info, resp
+
+
+def approve(device_id):
+    """Perform the administrator approval step (tools/manage_devices.py).
+
+    Called directly rather than over HTTP because approval is deliberately
+    NOT an network-exposed endpoint -- if a remote caller could approve its
+    own device, the control would be worthless. The IdP subprocess sees the
+    change because the device registry is shared through common/storage.py.
+    """
+    from idp import device_registry
+    return device_registry.approve_device(device_id, approved_by="test-suite")
+
+
+def enroll_and_sign(device_id, do_approve=True):
+    """Enroll, approve, and produce a valid attestation signature.
+
+    `do_approve` defaults True so existing tests read as before; the
+    approval step is what a real administrator does out of band after
+    confirming the device thumbprint.
+    """
+    from agent import device_attestation
+    info, _ = enroll_only(device_id)
+    if do_approve:
+        approve(device_id)
     chal = requests.post(f"{IDP_URL}/challenge", json={"device_id": device_id},
                           verify=False, timeout=5).json()
     sig = device_attestation.sign_nonce(device_id, chal["nonce"], info["hardware_backed"])
     return info["public_key_pem"], sig
 
 
-def access(resource, token):
+def device_proof_headers(token, method="GET", path=""):
+    """Build X-Device-Proof headers for a bound token, as the agent does."""
+    import base64 as _b64
+    import json as _json
+    import secrets as _secrets
+    import time as _time
+    from agent import device_attestation
+    from common import token_binding
+
+    payload_part = token.split(".")[1]
+    payload_part += "=" * (-len(payload_part) % 4)
+    claims = _json.loads(_b64.urlsafe_b64decode(payload_part))
+    if not claims.get("cnf"):
+        return {}
+
+    device_id = claims["device_id"]
+    info = device_attestation.ensure_enrolled(device_id)
+    nonce = _secrets.token_hex(16)
+    ts = int(_time.time())
+    payload = token_binding.build_proof_payload(claims["jti"], method, path, ts, nonce)
+    sig = device_attestation.sign_bytes(device_id, payload, info["hardware_backed"])
+    return {
+        token_binding.PROOF_HEADER: _b64.b64encode(sig).decode("ascii"),
+        token_binding.PROOF_DATA_HEADER: _b64.b64encode(payload).decode("ascii"),
+    }
+
+
+def access(resource, token, with_proof=True):
+    """Call the Gateway. Attaches a device proof when the token is bound.
+
+    `with_proof=False` simulates an attacker who has stolen the token string
+    but does not hold the device key.
+    """
     headers = {"Authorization": f"Bearer {token}"} if token else {}
-    return requests.get(f"{GATEWAY_URL}/access/{resource}", headers=headers, verify=False, timeout=5)
+    path = f"/access/{resource}"
+    if token and with_proof:
+        headers.update(device_proof_headers(token, "GET", path))
+    return requests.get(f"{GATEWAY_URL}{path}", headers=headers, verify=False, timeout=5)
 
 
 class TestAuthentication(unittest.TestCase):
@@ -483,22 +660,377 @@ class TestPolicyExternalization(unittest.TestCase):
 class TestMTLSIsolation(unittest.TestCase):
     """mTLS between Gateway and resources (docs/HARDENING.md item 5)."""
 
+   
     def test_direct_resource_connection_without_client_cert_is_refused(self):
+        """A client without the Gateway's certificate must never access /data.
+
+        TLS stacks differ slightly in where an mTLS rejection becomes visible:
+        some raise during the handshake, some on the first write/read, and some
+        close the connection without returning application data.
+
+        The security invariant is therefore that an unauthenticated TLS client
+        must never receive a successful HTTP response from the resource.
+        """
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE  # we don't care about the server's
-                                          # identity for this test -- we're
-                                          # checking that the SERVER refuses
-                                          # US for not presenting a client cert
-        raised = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        response = b""
+
         try:
-            with socket.create_connection(("127.0.0.1", 9101), timeout=3) as sock:
-                with ctx.wrap_socket(sock, server_hostname="127.0.0.1") as tls_sock:
-                    tls_sock.send(b"GET /data HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-                    tls_sock.recv(100)
-        except (ssl.SSLError, ConnectionResetError, ConnectionAbortedError, OSError):
-            raised = True
-        self.assertTrue(raised, "expected the resource to refuse a connection with no client certificate")
+            with socket.create_connection(
+                ("127.0.0.1", 9101),
+                timeout=3,
+            ) as sock:
+                with ctx.wrap_socket(
+                    sock,
+                    server_hostname="127.0.0.1",
+                ) as tls_sock:
+
+                    tls_sock.settimeout(3)
+
+                    tls_sock.sendall(
+                        b"GET /data HTTP/1.1\r\n"
+                        b"Host: 127.0.0.1\r\n"
+                        b"Connection: close\r\n"
+                        b"\r\n"
+                    )
+
+                    response = tls_sock.recv(4096)
+
+        except (
+            ssl.SSLError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+            BrokenPipeError,
+            TimeoutError,
+            OSError,
+        ):
+            # Expected: resource rejected the unauthenticated client.
+            return
+
+        # Some TLS implementations report rejection as a clean EOF.
+        if response == b"":
+            return
+
+        self.fail(
+            "resource returned application data to a client "
+            "that did not present a client certificate: "
+            f"{response[:200]!r}"
+        )
+
+
+class TestDeviceApproval(unittest.TestCase):
+    """Trust-on-first-use closure (production-readiness revision).
+
+    Previously the first enrollment for any device_id was accepted
+    unconditionally, so anyone who could reach /enroll could register their
+    own key and thereafter produce valid attestations. The cryptography was
+    never the weak part -- the binding to a device anyone had actually
+    vouched for was.
+    """
+
+    def test_enrollment_lands_in_pending_not_approved(self):
+        device_id = f"test-pending-{id(self)}"
+        _, resp = enroll_only(device_id)
+        self.assertEqual(resp.status_code, 202,
+                         "a device awaiting approval must not report 200 OK")
+        self.assertEqual(resp.json()["approval_status"], "pending")
+
+    def test_unapproved_device_cannot_attest(self):
+        from agent import device_attestation
+        device_id = f"test-unapproved-{id(self)}"
+        info, _ = enroll_only(device_id)  # deliberately NOT approved
+        chal = requests.post(f"{IDP_URL}/challenge", json={"device_id": device_id},
+                              verify=False, timeout=5).json()
+        sig = device_attestation.sign_nonce(device_id, chal["nonce"], info["hardware_backed"])
+        resp = login("bob", "Manager#2026", 95, device_id=device_id,
+                     attestation_signature=sig)
+        # The signature is cryptographically perfect. It is refused anyway,
+        # because nobody approved this device.
+        self.assertFalse(resp.json()["claims"]["attested"])
+
+    def test_unapproved_device_is_denied_the_gated_resource(self):
+        from agent import device_attestation
+        device_id = f"test-unapproved-gate-{id(self)}"
+        info, _ = enroll_only(device_id)
+        chal = requests.post(f"{IDP_URL}/challenge", json={"device_id": device_id},
+                              verify=False, timeout=5).json()
+        sig = device_attestation.sign_nonce(device_id, chal["nonce"], info["hardware_backed"])
+        token = login("bob", "Manager#2026", 95, device_id=device_id,
+                      attestation_signature=sig).json()["access_token"]
+        r = access("finance-app", token)
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["reason"], "attestation_required")
+
+    def test_approval_then_attestation_succeeds(self):
+        device_id = f"test-approved-{id(self)}"
+        _, signature = enroll_and_sign(device_id)  # enrolls AND approves
+        resp = login("bob", "Manager#2026", 95, device_id=device_id,
+                     attestation_signature=signature)
+        self.assertTrue(resp.json()["claims"]["attested"])
+
+    def test_reenrolling_with_a_different_key_resets_approval(self):
+        """Otherwise approval is trivially bypassable: enroll honestly, get
+        approved, then swap in any key you like."""
+        from idp import device_registry
+        device_id = f"test-rekey-{id(self)}"
+        enroll_and_sign(device_id)
+        self.assertTrue(device_registry.is_approved(device_id))
+
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        attacker_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        attacker_pem = attacker_key.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+        requests.post(f"{IDP_URL}/enroll", json={
+            "device_id": device_id, "public_key_pem": attacker_pem,
+        }, verify=False, timeout=5)
+
+        self.assertFalse(device_registry.is_approved(device_id),
+                         "swapping the key must force re-approval")
+
+
+class TestTokenBinding(unittest.TestCase):
+    """A stolen token must be useless without the device key."""
+
+    def test_token_for_approved_device_carries_cnf_claim(self):
+        device_id = f"test-cnf-{id(self)}"
+        _, signature = enroll_and_sign(device_id)
+        claims = login("bob", "Manager#2026", 95, device_id=device_id,
+                       attestation_signature=signature).json()["claims"]
+        self.assertIn("cnf", claims)
+        self.assertTrue(claims["cnf"].get("jkt"))
+
+    def test_bound_token_without_proof_is_rejected(self):
+        """The core exfiltration scenario: attacker has the token string
+        (from a log, a dump, a proxy) but not the device's private key."""
+        device_id = f"test-steal-{id(self)}"
+        _, signature = enroll_and_sign(device_id)
+        token = login("bob", "Manager#2026", 95, device_id=device_id,
+                      attestation_signature=signature).json()["access_token"]
+
+        self.assertEqual(access("finance-app", token).status_code, 200)
+
+        stolen = access("finance-app", token, with_proof=False)
+        self.assertEqual(stolen.status_code, 401)
+        self.assertEqual(stolen.json()["error"], "device_proof_missing")
+
+    def test_proof_cannot_be_replayed(self):
+        device_id = f"test-replay-{id(self)}"
+        _, signature = enroll_and_sign(device_id)
+        token = login("bob", "Manager#2026", 95, device_id=device_id,
+                      attestation_signature=signature).json()["access_token"]
+
+        headers = {"Authorization": f"Bearer {token}"}
+        headers.update(device_proof_headers(token, "GET", "/access/finance-app"))
+
+        first = requests.get(f"{GATEWAY_URL}/access/finance-app", headers=headers,
+                             verify=False, timeout=5)
+        self.assertEqual(first.status_code, 200)
+
+        replayed = requests.get(f"{GATEWAY_URL}/access/finance-app", headers=headers,
+                                verify=False, timeout=5)
+        self.assertEqual(replayed.status_code, 401)
+        self.assertEqual(replayed.json()["error"], "device_proof_replayed")
+
+    def test_proof_for_one_resource_cannot_be_used_for_another(self):
+        device_id = f"test-crossuse-{id(self)}"
+        _, signature = enroll_and_sign(device_id)
+        token = login("bob", "Manager#2026", 95, device_id=device_id,
+                      attestation_signature=signature).json()["access_token"]
+
+        headers = {"Authorization": f"Bearer {token}"}
+        headers.update(device_proof_headers(token, "GET", "/access/docs-app"))
+        r = requests.get(f"{GATEWAY_URL}/access/finance-app", headers=headers,
+                         verify=False, timeout=5)
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.json()["error"], "device_proof_wrong_request")
+
+
+class TestStepUpAuthentication(unittest.TestCase):
+    """`auth_time` freshness, distinct from token expiry."""
+
+    def test_token_carries_auth_time_and_amr(self):
+        claims = login("alice", "Intern#2026", 90).json()["claims"]
+        self.assertIsInstance(claims.get("auth_time"), int)
+        self.assertIn("pwd", claims.get("amr", []))
+        self.assertIn("otp", claims.get("amr", []))
+
+    def test_stale_auth_time_triggers_step_up(self):
+        from pdp import policy_engine
+        claims = {
+            "role": "finance_manager", "device_trust_score": 95, "attested": True,
+            "auth_time": int(time.time()) - 9999, "amr": ["pwd", "otp", "device"],
+        }
+        allow, reason = policy_engine.evaluate(claims, "finance-app")
+        self.assertFalse(allow)
+        self.assertTrue(reason.startswith("step_up_required"), reason)
+
+    def test_fresh_auth_time_passes(self):
+        from pdp import policy_engine
+        claims = {
+            "role": "finance_manager", "device_trust_score": 95, "attested": True,
+            "auth_time": int(time.time()), "amr": ["pwd", "otp", "device"],
+        }
+        allow, reason = policy_engine.evaluate(claims, "finance-app")
+        self.assertTrue(allow, reason)
+
+    def test_token_without_auth_time_fails_closed(self):
+        """A token predating this feature must NOT bypass step-up policy."""
+        from pdp import policy_engine
+        claims = {
+            "role": "finance_manager", "device_trust_score": 95, "attested": True,
+            "amr": ["pwd", "otp", "device"],
+        }
+        allow, reason = policy_engine.evaluate(claims, "finance-app")
+        self.assertFalse(allow)
+        self.assertIn("step_up_required", reason)
+
+    def test_missing_required_auth_method_is_denied(self):
+        from pdp import policy_engine
+        claims = {
+            "role": "finance_manager", "device_trust_score": 95, "attested": True,
+            "auth_time": int(time.time()), "amr": ["pwd"],  # no OTP
+        }
+        allow, reason = policy_engine.evaluate(claims, "finance-app")
+        self.assertFalse(allow)
+        self.assertIn("insufficient_auth_method", reason)
+
+
+class TestOperationalEndpoints(unittest.TestCase):
+
+    def test_health_endpoint_reports_liveness(self):
+        for url in (IDP_URL, GATEWAY_URL):
+            r = requests.get(f"{url}/health", verify=False, timeout=5)
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()["status"], "ok")
+
+    def test_ready_endpoint_reports_dependency_state(self):
+        r = requests.get(f"{GATEWAY_URL}/ready", verify=False, timeout=5)
+        self.assertIn(r.status_code, (200, 503))
+        body = r.json()
+        self.assertIn("checks", body)
+        self.assertIn("state_store", body["checks"])
+
+    def test_correlation_id_is_echoed_back(self):
+        from common.config import CORRELATION_HEADER
+        sent = "test-correlation-abc123"
+        r = requests.get(f"{GATEWAY_URL}/health", headers={CORRELATION_HEADER: sent},
+                         verify=False, timeout=5)
+        self.assertEqual(r.headers.get(CORRELATION_HEADER), sent)
+
+    def test_correlation_id_is_generated_when_absent(self):
+        from common.config import CORRELATION_HEADER
+        r = requests.get(f"{GATEWAY_URL}/health", verify=False, timeout=5)
+        generated = r.headers.get(CORRELATION_HEADER)
+        self.assertTrue(generated and generated != "-")
+
+
+class TestStorageBackend(unittest.TestCase):
+
+    def test_file_backend_round_trip_and_health(self):
+        import tempfile
+        from common.storage import FileBackend
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = FileBackend(tmp)
+            backend.set("ns", "key", {"value": 1})
+            self.assertEqual(backend.get("ns", "key"), {"value": 1})
+            backend.delete("ns", "key")
+            self.assertIsNone(backend.get("ns", "key"))
+            ok, _ = backend.health()
+            self.assertTrue(ok)
+
+    def test_atomic_write_retries_transient_windows_lock(self):
+        """Regression: os.replace fails with PermissionError (WinError 5) when
+        a cloud-sync client (OneDrive/Dropbox/Drive) momentarily holds the
+        destination open. This is not hypothetical -- this project's own
+        working folder is OneDrive-synced, and it broke device approval.
+        The lock is released within milliseconds, so we retry."""
+        import tempfile as _tf
+        import common.storage as _storage
+
+        real_replace = os.replace
+        attempts = {"n": 0}
+
+        def flaky_replace(src, dst):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise PermissionError(5, "Access is denied")
+            return real_replace(src, dst)
+
+        os.replace = flaky_replace
+        try:
+            with _tf.TemporaryDirectory() as tmp:
+                target = os.path.join(tmp, "state.json")
+                _storage.atomic_write_json(target, {"survived": True})
+                with open(target, encoding="utf-8") as f:
+                    self.assertEqual(json.load(f), {"survived": True})
+        finally:
+            os.replace = real_replace
+
+        self.assertEqual(attempts["n"], 3, "should have retried past the transient lock")
+
+    def test_atomic_write_gives_up_with_an_actionable_error(self):
+        """A permanent lock must not retry forever, and the error must name
+        the likely cause rather than surfacing a bare 'Access is denied'."""
+        import tempfile as _tf
+        import common.storage as _storage
+
+        real_replace = os.replace
+
+        def always_locked(src, dst):
+            raise PermissionError(5, "Access is denied")
+
+        os.replace = always_locked
+        try:
+            with _tf.TemporaryDirectory() as tmp:
+                with self.assertRaises(OSError) as ctx:
+                    _storage.atomic_write_json(os.path.join(tmp, "s.json"), {"a": 1})
+                self.assertIn("cloud-sync", str(ctx.exception))
+                leftovers = [f for f in os.listdir(tmp) if f.endswith(".tmp")]
+                self.assertEqual(leftovers, [], "temp file should be cleaned up on failure")
+        finally:
+            os.replace = real_replace
+
+    def test_corrupt_state_file_does_not_crash_the_service(self):
+        """It must degrade to empty rather than raise -- but see
+        common/storage.py: this is logged loudly because for the revocation
+        namespace 'empty' means 'nothing is revoked'."""
+        import tempfile, os as _os
+        from common.storage import FileBackend
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = FileBackend(tmp)
+            backend.set("ns", "k", 1)
+            with open(_os.path.join(tmp, "ns.json"), "w", encoding="utf-8") as f:
+                f.write("{not json")
+            self.assertEqual(backend.all("ns"), {})
+
+
+class TestPreflightValidation(unittest.TestCase):
+
+    def test_preflight_reports_findings_without_raising(self):
+        from common.preflight import collect_findings
+        findings = collect_findings("gateway")
+        self.assertIsInstance(findings, list)
+        for f in findings:
+            self.assertIn(f["severity"], ("ERROR", "WARN"))
+            self.assertTrue(f["detail"])
+
+    def test_missing_policy_file_is_a_blocking_error(self):
+        """A malformed or absent policy file must stop startup, not be
+        silently ignored -- an authorization system that cannot read its
+        policy has no business accepting requests."""
+        import common.preflight as preflight
+        original = preflight.POLICIES_FILE
+        try:
+            preflight.POLICIES_FILE = "/nonexistent/policies.json"
+            findings = preflight.collect_findings("gateway")
+            checks = [f["check"] for f in findings if f["severity"] == "ERROR"]
+            self.assertIn("policies_missing", checks)
+        finally:
+            preflight.POLICIES_FILE = original
 
 
 if __name__ == "__main__":

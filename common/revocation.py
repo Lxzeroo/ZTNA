@@ -37,11 +37,13 @@ def _load() -> dict:
 
 
 def _save(data: dict) -> None:
+    # Uses the shared atomic writer so the cloud-sync retry (OneDrive et al.
+    # briefly lock files, making os.replace fail with WinError 5) lives in
+    # one place -- see common/storage.py:atomic_write_json. Losing a write
+    # here means a revoked token stays usable, so it is worth retrying.
+    from common.storage import atomic_write_json
     os.makedirs(LOG_DIR, exist_ok=True)
-    tmp_path = REVOCATION_LIST_PATH + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-    os.replace(tmp_path, REVOCATION_LIST_PATH)  # atomic on POSIX and Windows
+    atomic_write_json(REVOCATION_LIST_PATH, data)
 
 
 def revoke(jti: str, exp: float = None, reason: str = "manual_revocation") -> None:

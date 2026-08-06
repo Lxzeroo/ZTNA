@@ -14,7 +14,11 @@
       "min_device_trust": 80,
       "require_attestation": true,
       "require_mtls": true,
-      "business_hours_only": false
+      "business_hours_only": false,
+      "max_auth_age_seconds": 300,
+      "_max_auth_age_note": "Step-up: the user must have authenticated within the last 5 minutes to reach this high-sensitivity resource, regardless of whether their token is still unexpired. Set to null or remove to disable. See pdp/policy_engine.py.",
+      "required_amr": ["pwd", "otp"],
+      "_required_amr_note": "Authentication methods this resource demands. Add \"device\" to require a cryptographically attested device login, not merely password+OTP."
     }
   }
 }

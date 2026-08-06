@@ -45,9 +45,9 @@ Network Access (ZTNA) to Secure Website Applications Based on ISO 25023"* (IEEE,
   `docs/DEVICE_ATTESTATION.md`.
 - **Full audit trail** -- every allow/deny decision logged to a
   hash-chained (tamper-evident) log; renders to a browsable HTML dashboard.
-- **Automated proof, not just a demo** -- 28 integration tests
+- **Automated proof, not just a demo** -- 52 integration tests
   (`tests/test_ztna.py`) exercise the real system end to end over real
-  HTTPS requests. All 28 pass (`docs/TEST_RESULTS_HARDENED.md`).
+  HTTPS requests. All 52 pass (`docs/TEST_RESULTS_HARDENED.md`).
 
 ## Quickstart (Windows)
 
@@ -70,6 +70,26 @@ python -m agent.client_agent --user alice --resource finance-app --demo    # DEN
 python -m agent.client_agent --user bob   --resource finance-app --demo    # ALLOWED (real device posture permitting -- see note below)
 python -m agent.client_agent --user carol --resource finance-app --demo --simulate-compromised  # DENIED (device trust)
 ```
+
+### One-time device approval
+
+`finance-app` requires cryptographic device attestation, and since the
+production-readiness pass a newly enrolled device waits for an
+administrator rather than being trusted on first use (see
+`docs/PRODUCTION_READINESS.md` section 3). The first `bob` run will
+therefore report the device as pending and print the command to fix it:
+
+```
+python -m tools.manage_devices --list --pending-only
+python -m tools.manage_devices --approve <device_id>
+```
+
+Re-run the `bob` command afterwards and it succeeds. This is the control
+working, not a failure.
+
+To skip approval entirely on a throwaway single-machine demo, start the
+services with `ZTNA_REQUIRE_DEVICE_APPROVAL=0` — preflight will warn on
+every startup that trust-on-first-use is active.
 
 Full walkthrough, including Windows Firewall network segmentation, mutual
 TLS, and wiring up a real authenticator app: **`docs/WINDOWS_SETUP.md`**.
@@ -111,11 +131,13 @@ resources/  Two protected backends (docs-app: low sensitivity,
 agent/      Client agent: device posture check (Windows/macOS/Linux) +
             login + resource access, incl. --watch mode
 tests/      Integration test suite (spins up all 4 services for real,
-            28 tests)
+            52 tests)
 dashboard/  Generates a self-contained HTML audit dashboard from the
             access log
 tools/      Admin CLIs: revoke_token.py, verify_audit_log.py,
-            provision_certs.py (multi-host PKI), network_probe.py (evidence)
+            provision_certs.py (multi-host PKI), network_probe.py (evidence),
+            manage_devices.py (enrollment approval), rotate_keys.py,
+            backup_audit_log.py, check_no_secrets.py
 deploy/     Reverse-proxy configs (nginx/Caddy) + HA deployment notes for
             a real multi-host deployment
 docs/       Architecture, hardening pass writeup, Windows setup guide,

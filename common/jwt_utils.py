@@ -24,7 +24,28 @@ from common import token_store
 
 
 def issue_token(username: str, role: str, device_id: str, device_trust_score: int,
-                 attested: bool = False) -> dict:
+                 attested: bool = False, cnf_jkt: str = None,
+                 auth_time: int = None, amr: list = None) -> dict:
+    """Mint a short-lived access token.
+
+    Three claims added in the production-readiness revision:
+
+    `cnf`       RFC 7800 confirmation. Pins the token to the thumbprint of
+                the device key that must sign a per-request proof
+                (common/token_binding.py). Present only for enrolled,
+                approved devices -- an unenrolled client would otherwise be
+                issued a token it can never use.
+
+    `auth_time` When the user last actually proved who they were, as
+                opposed to `iat`, which is merely when this token was
+                minted. The two diverge the moment token refresh exists,
+                and step-up policy cares about the former. OpenID Connect
+                defines `auth_time` with exactly this meaning.
+
+    `amr`       Authentication methods used ("pwd", "otp", "device"). Lets a
+                policy require *how* someone authenticated, not just that
+                they did.
+    """
     now = int(time.time())
     jti = uuid.uuid4().hex
     exp = now + TOKEN_TTL_SECONDS
@@ -35,14 +56,18 @@ def issue_token(username: str, role: str, device_id: str, device_trust_score: in
         "device_trust_score": device_trust_score,
         "attested": bool(attested),
         "iat": now,
+        "auth_time": int(auth_time if auth_time is not None else now),
+        "amr": amr or ["pwd", "otp"],
         "exp": exp,
         "jti": jti,
     }
+    if cnf_jkt:
+        claims["cnf"] = {"jkt": cnf_jkt}
     token = jwt.encode(claims, load_private_key_pem(), algorithm=JWT_ALGORITHM)
     if isinstance(token, bytes):  # PyJWT <2.0 compatibility
         token = token.decode("utf-8")
 
-    token_store.record_issued(jti, username, exp)
+    token_store.record_issued(jti, username, exp, device_id=device_id)
 
     return {"access_token": token, "token_type": "Bearer", "expires_in": TOKEN_TTL_SECONDS, "claims": claims}
 
