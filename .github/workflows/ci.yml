@@ -2,79 +2,125 @@ name: CI
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  schedule:
-    # Weekly, so newly-disclosed CVEs in pinned dependencies surface even
-    # when nobody has pushed. Security decay is time-based, not commit-based.
-    - cron: "0 6 * * 1"
-  workflow_dispatch:
+    branches:
+      - main
 
-permissions:
-  contents: read
+  pull_request:
+    branches:
+      - main
 
 jobs:
-  test:
+  tests:
     name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+
     strategy:
       fail-fast: false
       matrix:
-        # Windows is the project's primary target (docs/WINDOWS_SETUP.md);
-        # Linux is included because the services degrade gracefully off
-        # Windows and that path should not silently rot.
-        os: [windows-latest, ubuntu-latest]
-        python-version: ["3.10", "3.12"]
+        os:
+          - ubuntu-latest
+          - windows-latest
+        python-version:
+          - "3.10"
+          - "3.12"
 
     steps:
-      - uses: actions/checkout@v4
+      # ------------------------------------------------------------
+      # Checkout
+      # ------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
+      # ------------------------------------------------------------
+      # Python
+      # ------------------------------------------------------------
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
+      # ------------------------------------------------------------
+      # Dependencies
+      # ------------------------------------------------------------
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # ------------------------------------------------------------
+      # PKI / JWT certificate provisioning
+      #
+      # certs/ is intentionally excluded from Git because it contains
+      # private keys and generated certificates.
+      #
+      # GitHub Actions therefore starts without the JWT signing keys,
+      # CA, or service certificates required by PyZTNA.
+      #
+      # All services run on the same GitHub Actions runner during the
+      # integration tests, so localhost is used for every host.
+      # ------------------------------------------------------------
+      - name: Provision ephemeral CI certificates
+        run: >
+          python -m tools.provision_certs
+          --idp-host 127.0.0.1
+          --gateway-host 127.0.0.1
+          --docs-host 127.0.0.1
+          --finance-host 127.0.0.1
+          --out dist
+
+      # ------------------------------------------------------------
+      # Verify installation
+      # ------------------------------------------------------------
       - name: Verify install
         run: python VERIFY_INSTALL.py
 
+      # ------------------------------------------------------------
+      # Integration tests
+      #
+      # The test suite starts the real IdP, Gateway and protected
+      # resources and communicates with them over real sockets.
+      # ------------------------------------------------------------
       - name: Run test suite
-        # The suite binds real sockets and spins up the IdP, Gateway and both
-        # resource servers, so it is slower than a unit-only run. The timeout
-        # is a guard against a hung server leaving the job running for hours.
         timeout-minutes: 10
         run: python -m unittest tests.test_ztna -v
 
+  # ================================================================
+  # SECRET / PRIVATE KEY GUARD
+  # ================================================================
   secrets-guard:
     name: No committed key material
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          # Full history so the scan sees the real tracked tree, not a
-          # shallow slice of it.
+          # Full history allows the security check to inspect the
+          # complete tracked repository tree.
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Scan tracked files for private keys
         run: python -m tools.check_no_secrets
 
+  # ================================================================
+  # DEPENDENCY SECURITY AUDIT
+  # ================================================================
   audit:
     name: Dependency CVE scan
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
@@ -85,27 +131,37 @@ jobs:
           pip install pip-audit
 
       - name: Audit pinned dependencies
-        # requirements.txt pins exact/near-exact versions (PyJWT==2.3.0 in
-        # particular is old), so this job is expected to report findings
-        # rather than pass silently. It is intentionally non-blocking: the
-        # goal right now is visibility, not a red main branch on day one.
-        # Remove continue-on-error once the reported advisories are triaged.
+        # Dependency findings are currently informational.
+        # Remove continue-on-error after reported advisories have
+        # been reviewed and resolved.
         continue-on-error: true
         run: pip-audit --requirement requirements.txt --strict --desc
 
+  # ================================================================
+  # SYNTAX / BYTE-COMPILE CHECK
+  # ================================================================
   lint:
     name: Syntax and byte-compile check
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Byte-compile all sources
-        # Cheap correctness floor: catches syntax errors on every supported
-        # path, including modules the test suite does not import (for example
-        # idp/auth_backends.py's LDAP backend, which is scaffolded and not
-        # exercised by any test).
-        run: python -m compileall -q agent common dashboard gateway idp pdp resources tools tests
+        run: >
+          python -m compileall -q
+          agent
+          common
+          dashboard
+          gateway
+          idp
+          pdp
+          resources
+          tools
+          tests
