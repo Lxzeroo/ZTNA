@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, so newly-disclosed CVEs in pinned dependencies surface even
+    # when nobody has pushed. Security decay is time-based, not commit-based.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is the project's primary target (docs/WINDOWS_SETUP.md);
+        # Linux is included because the services degrade gracefully off
+        # Windows and that path should not silently rot.
+        os: [windows-latest, ubuntu-latest]
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify install
+        run: python VERIFY_INSTALL.py
+
+      - name: Run test suite
+        # The suite binds real sockets and spins up the IdP, Gateway and both
+        # resource servers, so it is slower than a unit-only run. The timeout
+        # is a guard against a hung server leaving the job running for hours.
+        timeout-minutes: 10
+        run: python -m unittest tests.test_ztna -v
+
+  secrets-guard:
+    name: No committed key material
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the scan sees the real tracked tree, not a
+          # shallow slice of it.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Scan tracked files for private keys
+        run: python -m tools.check_no_secrets
+
+  audit:
+    name: Dependency CVE scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit
+
+      - name: Audit pinned dependencies
+        # requirements.txt pins exact/near-exact versions (PyJWT==2.3.0 in
+        # particular is old), so this job is expected to report findings
+        # rather than pass silently. It is intentionally non-blocking: the
+        # goal right now is visibility, not a red main branch on day one.
+        # Remove continue-on-error once the reported advisories are triaged.
+        continue-on-error: true
+        run: pip-audit --requirement requirements.txt --strict --desc
+
+  lint:
+    name: Syntax and byte-compile check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Byte-compile all sources
+        # Cheap correctness floor: catches syntax errors on every supported
+        # path, including modules the test suite does not import (for example
+        # idp/auth_backends.py's LDAP backend, which is scaffolded and not
+        # exercised by any test).
+        run: python -m compileall -q agent common dashboard gateway idp pdp resources tools tests

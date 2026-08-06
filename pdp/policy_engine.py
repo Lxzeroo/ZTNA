@@ -22,7 +22,7 @@ import os
 import time
 import threading
 
-from common.config import RESOURCES, ROLE_LEVELS, POLICIES_FILE
+from common.config import RESOURCES, ROLE_LEVELS, POLICIES_FILE, STEP_UP_ENABLED
 
 _lock = threading.Lock()
 _policy_cache = {}
@@ -103,6 +103,42 @@ def evaluate(claims: dict, resource_name: str) -> tuple:
 
     if resource.get("require_attestation") and not claims.get("attested"):
         return False, "attestation_required"
+
+    # Step-up authentication (production-readiness revision).
+    #
+    # Distinct from token expiry. A token can be freshly minted -- valid
+    # `exp`, valid signature -- while the human behind it last proved who
+    # they were hours ago, because tokens get refreshed and sessions get
+    # resumed. `auth_time` records the latter. A high-sensitivity resource
+    # can therefore demand "you authenticated within the last N seconds",
+    # which is what every bank means by re-entering your password before a
+    # transfer, and is why OpenID Connect specifies `auth_time` separately
+    # from `iat`.
+    #
+    # Tokens minted before this revision have no auth_time. They are treated
+    # as failing the check rather than passing it: defaulting to "fresh"
+    # would mean an old token silently bypasses every step-up policy.
+    max_auth_age = resource.get("max_auth_age_seconds")
+    if STEP_UP_ENABLED and max_auth_age:
+        auth_time = claims.get("auth_time")
+        if not isinstance(auth_time, (int, float)):
+            return False, "step_up_required (token predates auth_time tracking)"
+        age = time.time() - auth_time
+        if age > max_auth_age:
+            return False, (
+                f"step_up_required (authenticated {int(age)}s ago, "
+                f"needs<={int(max_auth_age)}s)"
+            )
+
+    # Required authentication methods, e.g. ["pwd", "otp", "device"].
+    # Lets policy demand *how* the user authenticated, not merely that they
+    # did -- a device-attested login is a stronger claim than password+OTP.
+    required_amr = resource.get("required_amr")
+    if required_amr:
+        presented = set(claims.get("amr") or [])
+        missing = [m for m in required_amr if m not in presented]
+        if missing:
+            return False, f"insufficient_auth_method (missing={','.join(missing)})"
 
     if resource.get("business_hours_only") and not _within_business_hours():
         return False, "outside_business_hours"

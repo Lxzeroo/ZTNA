@@ -1,5 +1,131 @@
 # Changelog / Bug Fix Log
 
+## Production-readiness pass -- see docs/PRODUCTION_READINESS.md
+
+Ten gaps addressed, in three groups. Test count 28 -> 52.
+
+**Security controls**
+
+- Token binding (RFC 7800 `cnf` + DPoP-style per-request proof): a stolen
+  token is now useless without the device private key.
+- Step-up authentication: `auth_time` / `amr` claims, with per-resource
+  freshness requirements in `pdp/policies.json`.
+- Device enrollment approval: closes the trust-on-first-use gap
+  `docs/HARDENING.md` named as unaddressed. Enrollment returns 202 and
+  waits for an administrator (`tools/manage_devices.py`).
+- Key rotation: `tools/rotate_keys.py` plus `docs/KEY_ROTATION.md`,
+  including the emergency compromise path.
+
+**Operational**
+
+- `/health` (liveness) and `/ready` (readiness) on every service, kept
+  distinct so a dependency outage does not trigger a restart storm.
+- Graceful shutdown: readiness drops before the listener closes, then
+  in-flight requests drain.
+- `common/preflight.py`: configuration is validated before the port is
+  bound, and blocking problems refuse startup. This generalises the lesson
+  from the TPM bug below -- a security control that degrades silently is
+  worse than one that fails.
+- Structured JSON logs and an `X-Request-Id` correlation id propagated
+  IdP -> Gateway -> resource, kept separate from the hash-chained audit log
+  so the latter stays usable as evidence.
+- `tools/backup_audit_log.py`: verified backup/restore of the only forensic
+  record, with a manifest recording the chain head hash.
+
+**Data layer**
+
+- `common/storage.py`: one interface in front of revocation, rate-limit and
+  device state, so multi-instance deployment becomes a configuration choice
+  rather than a rewrite.
+
+**Repository hygiene**
+
+- MIT `LICENSE` added.
+- `.github/workflows/ci.yml`: tests on Windows and Linux across Python 3.10
+  and 3.12, dependency CVE scanning, byte-compile, and a guard that fails CI
+  if key material is ever committed again.
+- `tools/check_no_secrets.py`: the guard behind that job. Motivated by a
+  real finding -- five service private keys are recoverable from commit
+  `700c7ec` on the public `origin/main`. They are inert only because the CA
+  was later regenerated. See `docs/KEY_ROTATION.md`.
+
+One behavioural change worth flagging: with device approval enabled (the
+default), the README demo needs a one-time approval step, or
+`ZTNA_REQUIRE_DEVICE_APPROVAL=0` for a single-machine run. The agent prints
+the exact command when it hits a pending device rather than failing later
+with an unexplained `attestation_required`.
+
+### Three bugs found by running the pass on real Windows hardware
+
+All three passed on Linux and failed on Windows. Recorded because the first
+two are platform-specific traps that are easy to reintroduce.
+
+**1. Per-request logging deadlocked the services (presented as network timeouts).**
+
+*Symptom:* most tests failed with
+`ReadTimeoutError: HTTPSConnectionPool(host='127.0.0.1', port=9000)`. The
+IdP was running and had logged a successful start; it simply stopped
+answering partway through the run.
+
+*Root cause:* `tests/test_ztna.py` launches each service with
+`stdout=subprocess.PIPE` and never reads the pipe. A pipe nobody drains has
+a finite buffer — roughly 4 KB on Windows, 64 KB on Linux. This pass added
+an INFO log line per request, so the buffer filled, and the service blocked
+forever inside `write()`. Linux's larger buffer was big enough to survive
+the run, which is precisely why this was invisible until it ran on Windows.
+
+*Fix:* two independent changes, because either alone leaves the trap armed.
+Per-request logging moved from INFO to DEBUG (it is high volume and
+duplicates the audit log anyway), and the test harness now redirects service
+output to a temporary file instead of a pipe. Files have no buffer limit,
+and unlike `DEVNULL` the output survives for diagnosis — `_dump_service_logs()`
+prints it when startup fails, which is how bug 3 below was found in one run
+rather than several.
+
+*Lesson:* a blocked writer looks exactly like a network fault from the
+client side. The traceback points at the socket, and the cause is stdout.
+
+**2. `os.replace()` fails on OneDrive-synced folders (WinError 5).**
+
+*Symptom:* `PermissionError: [WinError 5] Access is denied:
+'logs\state\devices.json.tmp' -> 'logs\state\devices.json'` during device
+approval.
+
+*Root cause:* the atomic write in `common/storage.py` is correct — atomic
+replace is what makes a crash mid-write safe. But on Windows the destination
+can be briefly held open by *another process*, and cloud sync clients do
+exactly that whenever they notice a file change. This project's own working
+folder is OneDrive-synced, so it happened constantly.
+
+*Fix:* `common/storage.py:atomic_write_json()` retries with exponential
+backoff (the lock clears in milliseconds), cleans up its temp file on
+failure, and raises an error naming the likely cause instead of a bare
+"Access is denied". `common/revocation.py` and `common/token_store.py` now
+share that one implementation rather than each carrying their own
+`os.replace`.
+
+*Lesson:* "atomic on Windows" is true and still not sufficient; atomicity
+says nothing about contention.
+
+**3. Preflight raced itself across the four services.**
+
+*Symptom:* `docs-app` intermittently refused to start with
+`state directory is not writable ... No such file or directory:
+logs/state/.preflight_probe`.
+
+*Root cause:* the writability check wrote and deleted a probe file with a
+fixed name. All four services run preflight simultaneously at startup, so
+one process deleted the probe another was still using, and the loser
+reported the directory unwritable — refusing to start over a race rather
+than a real permissions problem.
+
+*Fix:* the probe filename now includes the pid, and cleanup tolerates the
+file already being gone. Verified with six concurrent processes.
+
+*Lesson:* a check that refuses startup has to be more careful than the thing
+it is checking. A false positive here is an outage.
+
+
 Kept deliberately -- a documented bug found during real-world testing (by
 someone other than the original author) and its fix is good evidence of an
 actual engineering process, not just a first-draft submission.

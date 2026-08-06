@@ -36,7 +36,15 @@ CHECKS = [
     ("agent/device_attestation.py", "_debug(", "Attestation failures are diagnosable"),
     ("agent/device_posture.py", "fdesetup", "Posture checks cover macOS"),
     ("agent/device_posture.py", "cryptsetup", "Posture checks cover Linux"),
-    ("common/http_utils.py", "PyZTNA/2.0", "Server version string is current"),
+    ("common/http_utils.py", "PyZTNA/2.1", "Server version string is current"),
+    # --- production-readiness pass (docs/PRODUCTION_READINESS.md) ---
+    ("common/jwt_utils.py", "auth_time", "Tokens carry auth_time for step-up policy"),
+    ("common/jwt_utils.py", "cnf_jkt", "Tokens can be bound to a device key"),
+    ("common/http_utils.py", "_builtin_ready", "Readiness endpoint is present"),
+    ("common/http_utils.py", "_drain_and_stop", "Graceful shutdown is wired up"),
+    ("idp/device_registry.py", "STATUS_PENDING", "Device enrollment requires approval"),
+    ("pdp/policy_engine.py", "max_auth_age", "PDP enforces step-up freshness"),
+    ("gateway/gateway_server.py", "token_requires_proof", "Gateway enforces token binding"),
 ]
 
 REQUIRED_FILES = [
@@ -45,6 +53,13 @@ REQUIRED_FILES = [
     "idp/auth_backends.py", "pdp/policies.json",
     "tools/revoke_token.py", "tools/verify_audit_log.py",
     "docs/HARDENING.md",
+    # production-readiness pass
+    "common/storage.py", "common/obs.py", "common/preflight.py",
+    "common/token_binding.py",
+    "tools/manage_devices.py", "tools/rotate_keys.py",
+    "tools/backup_audit_log.py", "tools/check_no_secrets.py",
+    "docs/PRODUCTION_READINESS.md", "docs/KEY_ROTATION.md",
+    "LICENSE", ".github/workflows/ci.yml",
 ]
 
 # Markers that must be ABSENT -- these indicate a stale pre-hardening file.
@@ -80,7 +95,7 @@ def main():
 
     total = len(CHECKS) + len(REQUIRED_FILES) + len(FORBIDDEN)
     if failures:
-        print("FAILED -- this tree is not a clean v2.0.1 install:\n")
+        print("FAILED -- this tree is not a clean v2.2.0 install:\n")
         for f in failures:
             print("  " + f)
         print(f"\n{len(failures)} problem(s) across {total} checks.")
@@ -88,7 +103,7 @@ def main():
         sys.exit(1)
 
     print(f"OK -- all {total} checks passed. This is a complete, correctly-wired v2.1.0 tree.")
-    print("\nNext: python -m unittest tests.test_ztna -v      (expect 28 tests, OK)")
+    print("\nNext: python -m unittest tests.test_ztna -v      (expect 52 tests, OK)")
     sys.exit(0)
 
 

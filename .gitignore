@@ -17,3 +17,13 @@ venv/
 certs/*
 !certs/.gitkeep
 dist/
+
+# Production-readiness pass: runtime state and evidence.
+# logs/state/ holds the revocation list, login lockouts and the device
+# registry (common/storage.py). logs/backups/ holds audit-log backups --
+# those are evidence and may contain usernames, device ids and source IPs,
+# so they belong in your retention system, not in git.
+logs/state/
+logs/backups/
+logs/.preflight_probe*
+certs/archive/

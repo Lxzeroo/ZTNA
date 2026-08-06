@@ -289,14 +289,25 @@ def sign_nonce(device_id: str, nonce_b64: str, hardware_backed: bool) -> str:
     `hardware_backed` should be whatever ensure_enrolled() reported, so
     signing uses the SAME key material that was actually enrolled."""
     nonce = base64.b64decode(nonce_b64)
+    return base64.b64encode(sign_bytes(device_id, nonce, hardware_backed)).decode("ascii")
+
+
+def sign_bytes(device_id: str, message: bytes, hardware_backed: bool) -> bytes:
+    """Sign arbitrary bytes with the device key.
+
+    Split out from sign_nonce() so token-binding proofs
+    (common/token_binding.py) sign a structured payload rather than a
+    server-issued nonce, while provably using the identical key and
+    algorithm. Two separate signing implementations would eventually drift
+    and fail as an unexplained "invalid signature".
+    """
     if hardware_backed:
-        sig = _windows_sign(device_id, nonce)
+        sig = _windows_sign(device_id, message)
         if sig is not None:
-            return base64.b64encode(sig).decode("ascii")
+            return sig
         raise RuntimeError("TPM signing failed after successful TPM enrollment; "
                             "re-run enrollment or check TPM/provider status")
-    sig = _fallback_sign(device_id, nonce)
-    return base64.b64encode(sig).decode("ascii")
+    return _fallback_sign(device_id, message)
 
 
 if __name__ == "__main__":

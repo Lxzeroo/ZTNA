@@ -22,9 +22,11 @@ Usage examples:
     python -m agent.client_agent --user carol --resource finance-app --demo --simulate-compromised
 """
 import argparse
+import base64
 import getpass
 import json
 import os
+import secrets
 import sys
 import time
 
@@ -37,6 +39,7 @@ urllib3.disable_warnings()
 from common.config import IDP_HOST, IDP_PORT, GATEWAY_HOST, GATEWAY_PORT
 from common.totp import current_totp
 from common.tls_utils import scheme as _tls_scheme
+from common import token_binding
 from agent.device_posture import compute_trust_score
 from agent import device_attestation
 
@@ -64,10 +67,23 @@ def _do_attestation(device_id: str):
         print(f"[agent] device attestation key ready (mode={mode}, "
               f"hardware_backed={enroll_info['hardware_backed']})")
 
-        requests.post(f"{IDP_URL}/enroll", json={
+        enroll_resp = requests.post(f"{IDP_URL}/enroll", json={
             "device_id": device_id,
             "public_key_pem": enroll_info["public_key_pem"],
         }, verify=False, timeout=5)
+
+        # 202 = enrolled but awaiting administrator approval. Say so plainly
+        # and print the exact command needed, rather than letting the user
+        # discover it later as an unexplained "attestation_required" denial.
+        if enroll_resp.status_code == 202:
+            info = enroll_resp.json()
+            print(f"[agent] device is enrolled but NOT YET APPROVED "
+                  f"(thumbprint {info.get('thumbprint', '')[:16]}...)")
+            print(f"[agent] an administrator must run:")
+            print(f"[agent]     python -m tools.manage_devices --approve {device_id}")
+            print(f"[agent] until then this device cannot attest, and resources "
+                  f"requiring attestation will deny access.")
+            return None
 
         chal = requests.post(f"{IDP_URL}/challenge", json={"device_id": device_id},
                               verify=False, timeout=5)
@@ -113,15 +129,70 @@ def authenticate(username: str, password: str, demo: bool, simulate_compromised:
         print(f"[agent] AUTH FAILED: {resp.status_code} {resp.json()}")
         return None
     data = resp.json()
-    attested = data["claims"].get("attested", False)
-    print(f"[agent] authenticated OK (attested={attested}), token expires in {data['expires_in']}s")
+    claims = data["claims"]
+    attested = claims.get("attested", False)
+    bound = bool(claims.get("cnf"))
+    print(f"[agent] authenticated OK (attested={attested}, token_bound={bound}), "
+          f"token expires in {data['expires_in']}s")
+    if bound:
+        print("[agent] token is bound to this device's key -- it cannot be used elsewhere")
     return data["access_token"]
 
 
+def _build_device_proof(claims: dict, method: str, path: str):
+    """Produce the X-Device-Proof headers for a bound token.
+
+    Returns {} when the token carries no `cnf` claim, so an unenrolled or
+    unapproved device keeps working exactly as before rather than being
+    locked out by a feature it cannot participate in.
+    """
+    if not claims.get("cnf"):
+        return {}
+    try:
+        device_id = device_attestation.get_local_device_id()
+        info = device_attestation.ensure_enrolled(device_id)
+        nonce = secrets.token_hex(16)
+        timestamp = int(time.time())
+        payload = token_binding.build_proof_payload(
+            claims["jti"], method, path, timestamp, nonce
+        )
+        signature = device_attestation.sign_bytes(
+            device_id, payload, info["hardware_backed"]
+        )
+        return {
+            token_binding.PROOF_HEADER: base64.b64encode(signature).decode("ascii"),
+            token_binding.PROOF_DATA_HEADER: base64.b64encode(payload).decode("ascii"),
+        }
+    except Exception as e:  # noqa: BLE001
+        # Do not silently proceed unsigned -- the request will be denied at
+        # the Gateway and "device_proof_missing" is a far more confusing
+        # thing to debug than the actual signing error.
+        print(f"[agent] WARNING: could not build device proof ({e}); "
+              f"the Gateway will reject this bound token.")
+        return {}
+
+
+def _decode_claims_unverified(token: str) -> dict:
+    """Read our own token's claims to decide whether a proof is needed.
+
+    Unverified is fine here and only here: this is the client reading a
+    token it was just handed, purely to shape its next request. Nothing is
+    authorized on the basis of it -- the Gateway independently verifies the
+    signature. Never use this pattern server-side.
+    """
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def request_resource(resource: str, token: str):
-    resp = requests.get(f"{GATEWAY_URL}/access/{resource}", headers={
-        "Authorization": f"Bearer {token}"
-    }, verify=False, timeout=5)
+    path = f"/access/{resource}"
+    headers = {"Authorization": f"Bearer {token}"}
+    headers.update(_build_device_proof(_decode_claims_unverified(token), "GET", path))
+    resp = requests.get(f"{GATEWAY_URL}{path}", headers=headers, verify=False, timeout=5)
     return resp.status_code, resp.json()
 
 
